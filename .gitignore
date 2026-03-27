@@ -1,0 +1,6 @@
+# Downloaded assets (fetched via scripts/fetch_icons.mjs)
+assets/icons/
+assets/data/
+
+# Node.js
+node_modules/
