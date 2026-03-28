@@ -5,7 +5,14 @@
 
 const std = @import("std");
 
+pub const grid = @import("grid.zig");
+
 test "library loads" {
     // Placeholder: confirms the build and test pipeline works.
     try std.testing.expect(true);
+}
+
+test {
+    // Pull in all module tests.
+    std.testing.refAllDecls(@This());
 }
