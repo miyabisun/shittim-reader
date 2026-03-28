@@ -1,131 +1,183 @@
 //! Digit OCR: recognize quantity numbers from cell footer regions.
 //!
-//! Uses masked NCC on the green channel to match digit templates.
-//! Templates are embedded at compile time from pre-processed gray/mask files.
-//! Pre-processing: scripts/preprocess_digits.mjs converts RGBA PNGs to
-//! separate green-channel (.gray) and alpha-channel (.mask) files.
+//! Uses blue gradient weight mapping and projection profile analysis
+//! to segment and classify digits. The game font uses a distinctive
+//! #2D4663 → #FFFFFF gradient that enables color-based segmentation.
 
 const std = @import("std");
-const ncc_mod = @import("ncc.zig");
+const blue_weight = @import("blue_weight.zig");
+const proj = @import("projection.zig");
+const digit_mod = @import("digit.zig");
 
-pub const Template = struct {
-    width: u32,
-    height: u32,
-    gray: []const u8, // green channel values (width * height bytes)
-    mask: []const u8, // alpha channel values (width * height bytes)
-};
+// NOTE: skew_factor is also used in scripts/extract_digit_profiles.mjs
+// and scripts/skew_test.mjs — keep in sync.
+const skew_factor: f32 = 0.25;
 
-/// Pre-extracted digit templates (index 0-9 = digits, 10 = 'x').
-/// Gray and mask are separate @embedFile'd files (no comptime extraction needed).
-pub const templates = [11]Template{
-    .{ .width = 15, .height = 21, .gray = @embedFile("digits/0.gray"), .mask = @embedFile("digits/0.mask") },
-    .{ .width = 10, .height = 21, .gray = @embedFile("digits/1.gray"), .mask = @embedFile("digits/1.mask") },
-    .{ .width = 17, .height = 21, .gray = @embedFile("digits/2.gray"), .mask = @embedFile("digits/2.mask") },
-    .{ .width = 17, .height = 21, .gray = @embedFile("digits/3.gray"), .mask = @embedFile("digits/3.mask") },
-    .{ .width = 16, .height = 22, .gray = @embedFile("digits/4.gray"), .mask = @embedFile("digits/4.mask") },
-    .{ .width = 17, .height = 21, .gray = @embedFile("digits/5.gray"), .mask = @embedFile("digits/5.mask") },
-    .{ .width = 17, .height = 21, .gray = @embedFile("digits/6.gray"), .mask = @embedFile("digits/6.mask") },
-    .{ .width = 17, .height = 21, .gray = @embedFile("digits/7.gray"), .mask = @embedFile("digits/7.mask") },
-    .{ .width = 16, .height = 21, .gray = @embedFile("digits/8.gray"), .mask = @embedFile("digits/8.mask") },
-    .{ .width = 15, .height = 20, .gray = @embedFile("digits/9.gray"), .mask = @embedFile("digits/9.mask") },
-    .{ .width = 18, .height = 17, .gray = @embedFile("digits/x.gray"), .mask = @embedFile("digits/x.mask") },
-};
+// Max deskewed image dimensions for stack buffer.
+// Number regions are ~49x24; after shear the width grows by ceil(0.25 * height).
+const max_deskew_src_w: u32 = 80;
+const max_deskew_src_h: u32 = 40;
+const max_deskew_dst_w: u32 = max_deskew_src_w + max_deskew_src_h;
+const max_deskew_buf_size: u32 = max_deskew_dst_w * max_deskew_src_h * 3;
 
-const x_template_idx: usize = 10;
-const match_threshold: f32 = 0.5;
+/// Threshold for 'x' detection: segments with peak below this at the
+/// left edge are considered the 'x' prefix character.
+const x_peak_threshold: f32 = 4.0;
 
-// Max template dimensions for stack-allocated patch buffer (derived from templates at comptime)
-const max_tmpl_w = blk: {
-    var m: u32 = 0;
-    for (templates) |t| m = @max(m, t.width);
-    break :blk m;
-};
-const max_tmpl_h = blk: {
-    var m: u32 = 0;
-    for (templates) |t| m = @max(m, t.height);
-    break :blk m;
-};
+/// Minimum peak to keep a segment (noise filter).
+const noise_peak_threshold: f32 = 3.0;
 
-/// Extract a patch of green channel values from an RGB image into a provided buffer.
-/// Returns the filled slice, or null if the patch extends beyond image bounds.
-fn extractGreenPatchBuf(
+/// Maximum start column for a segment to be considered the 'x' prefix.
+const x_max_start_col: u32 = 8;
+
+/// Minimum segment width to keep (noise filter).
+const noise_min_width: u32 = 5;
+
+/// Apply horizontal shear to correct italic (right-leaning) text.
+///
+/// Each output pixel (ox, oy) samples from input at (ox + skew * oy, oy)
+/// using bilinear interpolation. The output is wider by ceil(skew * height).
+/// Pixels outside the input bounds are filled with black (0).
+fn deskew(
     buf: []u8,
     pixels: []const u8,
-    img_w: u32,
-    img_h: u32,
-    px: u32,
-    py: u32,
-    pw: u32,
-    ph: u32,
-) ?[]u8 {
-    if (px + pw > img_w or py + ph > img_h) return null;
-    const len = pw * ph;
-    if (len > buf.len) return null;
-    for (0..ph) |dy| {
-        for (0..pw) |dx| {
-            const src_idx = ((@as(usize, py) + dy) * img_w + @as(usize, px) + dx) * 3;
-            buf[dy * pw + dx] = pixels[src_idx + 1]; // green channel
-        }
-    }
-    return buf[0..len];
-}
+    w: u32,
+    h: u32,
+) struct { pixels: []u8, w: u32 } {
+    const extra: u32 = @intFromFloat(@ceil(skew_factor * @as(f32, @floatFromInt(h))));
+    const dst_w = w + extra;
+    const dst_len = dst_w * h * 3;
 
-/// Evaluate NCC score for a single template at a specific position.
-/// Uses a stack buffer — no heap allocation.
-fn scoreAt(
-    pixels: []const u8,
-    img_w: u32,
-    img_h: u32,
-    tmpl: Template,
-    px: u32,
-    py: u32,
-) ?f32 {
-    var buf: [max_tmpl_w * max_tmpl_h]u8 = undefined;
-    const patch = extractGreenPatchBuf(
-        &buf,
-        pixels,
-        img_w,
-        img_h,
-        px,
-        py,
-        tmpl.width,
-        tmpl.height,
-    ) orelse return null;
-    return ncc_mod.maskedNcc(patch, tmpl.gray, tmpl.mask);
-}
+    std.debug.assert(dst_len <= buf.len);
 
-/// Find the best match position for a template in a horizontal scan range.
-/// Returns (x_position, score) or null if no match above threshold.
-fn findTemplate(
-    pixels: []const u8,
-    img_w: u32,
-    img_h: u32,
-    tmpl: Template,
-    search_x_start: u32,
-    search_x_end: u32,
-    search_y: u32,
-) ?struct { x: u32, score: f32 } {
-    var best_score: f32 = -1;
-    var best_x: u32 = 0;
+    for (0..h) |oy| {
+        const shift = skew_factor * @as(f32, @floatFromInt(oy));
+        for (0..dst_w) |ox| {
+            const dst_idx = (oy * dst_w + ox) * 3;
+            const src_xf = @as(f32, @floatFromInt(ox)) - shift;
 
-    const end_x = if (search_x_end > tmpl.width) search_x_end - tmpl.width else 0;
-    var x = search_x_start;
-    while (x <= end_x) : (x += 1) {
-        const score = scoreAt(pixels, img_w, img_h, tmpl, x, search_y) orelse continue;
-        if (score > best_score) {
-            best_score = score;
-            best_x = x;
+            if (src_xf < 0 or src_xf >= @as(f32, @floatFromInt(w)) - 1) {
+                if (src_xf >= 0 and src_xf < @as(f32, @floatFromInt(w))) {
+                    const sx: u32 = @intFromFloat(src_xf);
+                    const src_idx = (oy * w + sx) * 3;
+                    buf[dst_idx] = pixels[src_idx];
+                    buf[dst_idx + 1] = pixels[src_idx + 1];
+                    buf[dst_idx + 2] = pixels[src_idx + 2];
+                } else {
+                    buf[dst_idx] = 0;
+                    buf[dst_idx + 1] = 0;
+                    buf[dst_idx + 2] = 0;
+                }
+                continue;
+            }
+
+            const sx0: u32 = @intFromFloat(@floor(src_xf));
+            const frac = src_xf - @floor(src_xf);
+            const sx1 = sx0 + 1;
+            const idx0 = (oy * w + sx0) * 3;
+            const idx1 = (oy * w + sx1) * 3;
+
+            for (0..3) |ch| {
+                const v0: f32 = @floatFromInt(pixels[idx0 + ch]);
+                const v1: f32 = @floatFromInt(pixels[idx1 + ch]);
+                const blended = v0 * (1.0 - frac) + v1 * frac;
+                buf[dst_idx + ch] = @intFromFloat(@round(blended));
+            }
         }
     }
 
-    if (best_score >= match_threshold) {
-        return .{ .x = best_x, .score = best_score };
+    return .{ .pixels = buf[0..dst_len], .w = dst_w };
+}
+
+/// Recognize digits from an already-deskewed number region image.
+/// This is the core pipeline: weight map → projection → segment → classify.
+pub fn recognizeDigits(
+    pixels: []const u8,
+    w: u32,
+    h: u32,
+) ?u32 {
+    // Step 1: Compute blue gradient weight map
+    var wmap_buf: [blue_weight.max_weight_map_size]f32 = undefined;
+    const wmap = blue_weight.computeWeightMap(&wmap_buf, pixels, w, h);
+
+    // Step 2: Column projection
+    var col_buf: [proj.max_profile_w]f32 = undefined;
+    const col_prof = proj.columnProjection(wmap, w, h, &col_buf);
+
+    // Step 3: Segment characters
+    var seg_buf: [proj.max_segments]proj.Segment = undefined;
+    const raw_segs = proj.segmentCharacters(col_prof, &seg_buf);
+
+    if (raw_segs.len == 0) return null;
+
+    // Step 4: Post-process segments — filter noise and skip 'x'
+    var digit_segs: [proj.max_segments]proj.Segment = undefined;
+    var n_digit_segs: u32 = 0;
+    var skipped_x = false;
+
+    for (raw_segs) |seg| {
+        // Find peak value in this segment
+        var peak: f32 = 0;
+        for (seg.start..seg.end) |c| {
+            peak = @max(peak, col_prof[c]);
+        }
+
+        // Filter noise: narrow segments with low peak
+        if (peak < noise_peak_threshold and seg.width() < noise_min_width) continue;
+
+        // Detect 'x' prefix: first segment at left edge with low peak
+        if (!skipped_x and seg.start < x_max_start_col and peak < x_peak_threshold) {
+            skipped_x = true;
+            continue;
+        }
+
+        if (n_digit_segs < digit_segs.len) {
+            digit_segs[n_digit_segs] = seg;
+            n_digit_segs += 1;
+        }
     }
-    return null;
+
+    if (n_digit_segs == 0) return null;
+
+    // Step 5: Classify each digit segment
+    var value: u32 = 0;
+    var row_buf: [proj.max_profile_h]f32 = undefined;
+
+    for (digit_segs[0..n_digit_segs]) |seg| {
+        // Column profile for this character
+        const char_col = col_prof[seg.start..seg.end];
+        var norm_col: [digit_mod.n_col_bins]f32 = undefined;
+        proj.normalizeProfile(char_col, &norm_col);
+
+        // Row profile for this character
+        const char_row = proj.rowProjection(wmap, w, h, seg.start, seg.end, &row_buf);
+        var norm_row: [digit_mod.n_row_bins]f32 = undefined;
+        proj.normalizeProfile(char_row, &norm_row);
+
+        // Upper and lower half row profiles.
+        // Note: assumes h is even. All game footer regions are 24px tall.
+        const half_h = h / 2;
+        var norm_upper: [digit_mod.n_row_half_bins]f32 = undefined;
+        var norm_lower: [digit_mod.n_row_half_bins]f32 = undefined;
+        proj.normalizeProfile(char_row[0..half_h], &norm_upper);
+        proj.normalizeProfile(char_row[half_h..h], &norm_lower);
+
+        const d = digit_mod.classifyDigit(.{
+            .col = norm_col,
+            .row = norm_row,
+            .row_upper = norm_upper,
+            .row_lower = norm_lower,
+        });
+
+        value = value * 10 + d;
+    }
+
+    return value;
 }
 
 /// Parse a quantity from a number region image.
-/// The region contains green text "x{number}" on a dark background.
+/// The region contains italic blue text "x{number}" on an icon background.
+/// A horizontal shear (deskew) is applied first to correct the italic lean.
 ///
 /// pixels: RGB buffer of the number region
 /// w, h: dimensions
@@ -135,111 +187,10 @@ pub fn parseQuantity(
     w: u32,
     h: u32,
 ) ?u32 {
-    const x_tmpl = templates[x_template_idx];
-
-    // Vertical center for template alignment
-    const y_offset: u32 = if (h > x_tmpl.height) (h - x_tmpl.height) / 2 else 0;
-
-    // Step 1: Find "x" character
-    const x_result = findTemplate(
-        pixels,
-        w,
-        h,
-        x_tmpl,
-        0,
-        w,
-        y_offset,
-    ) orelse return null;
-
-    // Step 2: Read digits after "x"
-    var cursor = x_result.x + x_tmpl.width;
-    var value: u32 = 0;
-    var found_digit = false;
-
-    while (cursor < w) {
-        var best_digit: ?u32 = null;
-        var best_score: f32 = -1;
-        var best_x: u32 = 0;
-        var best_width: u32 = 0;
-
-        // Try each digit template at a small window around cursor
-        for (0..10) |d| {
-            const tmpl = templates[d];
-            const dy: u32 = if (h > tmpl.height) (h - tmpl.height) / 2 else 0;
-
-            const result = findTemplate(
-                pixels,
-                w,
-                h,
-                tmpl,
-                cursor,
-                @min(cursor + tmpl.width + 4, w),
-                dy,
-            ) orelse continue;
-
-            if (result.score > best_score) {
-                best_score = result.score;
-                best_digit = @intCast(d);
-                best_x = result.x;
-                best_width = tmpl.width;
-            }
-        }
-
-        if (best_digit) |digit| {
-            value = value * 10 + digit;
-            cursor = best_x + best_width; // advance to end of matched digit
-            found_digit = true;
-        } else {
-            break;
-        }
-    }
-
-    if (!found_digit) return null;
-    return value;
+    var deskew_buf: [max_deskew_buf_size]u8 = undefined;
+    const deskewed = deskew(&deskew_buf, pixels, w, h);
+    return recognizeDigits(deskewed.pixels, deskewed.w, h);
 }
 
-// ── Tests ──
-
-test "templates loaded correctly" {
-    for (templates, 0..) |tmpl, i| {
-        try std.testing.expect(tmpl.width > 0);
-        try std.testing.expect(tmpl.height > 0);
-        try std.testing.expectEqual(@as(usize, tmpl.width * tmpl.height), tmpl.gray.len);
-        try std.testing.expectEqual(@as(usize, tmpl.width * tmpl.height), tmpl.mask.len);
-
-        var has_nonzero = false;
-        for (tmpl.mask) |m| {
-            if (m != 0) {
-                has_nonzero = true;
-                break;
-            }
-        }
-        if (!has_nonzero) {
-            std.debug.print("Warning: template {d} has all-zero mask\n", .{i});
-        }
-    }
-}
-
-test "template dimensions match expected" {
-    try std.testing.expectEqual(@as(u32, 15), templates[0].width);
-    try std.testing.expectEqual(@as(u32, 21), templates[0].height);
-    try std.testing.expectEqual(@as(u32, 10), templates[1].width);
-    try std.testing.expectEqual(@as(u32, 21), templates[1].height);
-    try std.testing.expectEqual(@as(u32, 18), templates[10].width);
-    try std.testing.expectEqual(@as(u32, 17), templates[10].height);
-}
-
-test "perfect digit self-match" {
-    const tmpl = templates[0];
-
-    // Build an RGB image from the template's green channel
-    var img: [max_tmpl_w * max_tmpl_h * 3]u8 = undefined;
-    for (0..tmpl.width * tmpl.height) |i| {
-        img[i * 3] = 0;
-        img[i * 3 + 1] = tmpl.gray[i];
-        img[i * 3 + 2] = 0;
-    }
-
-    const score = scoreAt(img[0 .. tmpl.width * tmpl.height * 3], tmpl.width, tmpl.height, tmpl, 0, 0) orelse unreachable;
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), score, 1e-3);
-}
+// Integration tests live in test/ocr_test.zig (separate module to keep
+// test fixture data out of the src/ package path).

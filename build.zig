@@ -10,9 +10,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // Note: digit templates are at src/digits/*.raw for @embedFile access.
-    // Icon templates will use assets/build/ via addEmbedPath when ready.
-
     // ── CLI executable (developer tool) ──
     const exe = b.addExecutable(.{
         .name = "shittim",
@@ -37,17 +34,34 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Tests ──
+    const test_step = b.step("test", "Run all unit tests");
+
+    // Library unit tests (src/ only — no test fixture data)
     const lib_tests = b.addTest(.{
         .root_module = lib_mod,
     });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
+    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
+    // CLI tests
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
-    const test_step = b.step("test", "Run all unit tests");
-    test_step.dependOn(&run_lib_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    // OCR integration tests (test fixtures embedded from test_fixtures/)
+    const ocr_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("test_fixtures/ocr_fixtures.zig"),
+        .target = target,
+    });
+    const ocr_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/ocr_test.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "shittim_reader", .module = lib_mod },
+                .{ .name = "ocr_fixtures", .module = ocr_fixture_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ocr_tests).step);
 }

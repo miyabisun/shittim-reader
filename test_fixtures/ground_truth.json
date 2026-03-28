@@ -1,28 +1,28 @@
 {
   "screen.png": {
     "grid_size": [5, 4],
-    "note": "quantity from items.yml; item_id requires manual icon matching (TODO)",
+    "note": "quantity verified by manual inspection; item_id requires manual icon matching (TODO)",
     "items": [
-      { "row": 0, "col": 0, "item_id": null, "quantity": 92 },
+      { "row": 0, "col": 0, "item_id": null, "quantity": 924 },
       { "row": 0, "col": 1, "item_id": null, "quantity": 381 },
       { "row": 0, "col": 2, "item_id": null, "quantity": 95 },
       { "row": 0, "col": 3, "item_id": null, "quantity": 1892 },
-      { "row": 0, "col": 4, "item_id": null, "quantity": 380 },
-      { "row": 1, "col": 0, "item_id": null, "quantity": 16 },
-      { "row": 1, "col": 1, "item_id": null, "quantity": 13 },
-      { "row": 1, "col": 2, "item_id": null, "quantity": 191 },
-      { "row": 1, "col": 3, "item_id": null, "quantity": 49 },
-      { "row": 1, "col": 4, "item_id": null, "quantity": 9 },
+      { "row": 0, "col": 4, "item_id": null, "quantity": 330 },
+      { "row": 1, "col": 0, "item_id": null, "quantity": 155 },
+      { "row": 1, "col": 1, "item_id": null, "quantity": 137 },
+      { "row": 1, "col": 2, "item_id": null, "quantity": 1917 },
+      { "row": 1, "col": 3, "item_id": null, "quantity": 849 },
+      { "row": 1, "col": 4, "item_id": null, "quantity": 396 },
       { "row": 2, "col": 0, "item_id": null, "quantity": 206 },
-      { "row": 2, "col": 1, "item_id": null, "quantity": 112 },
-      { "row": 2, "col": 2, "item_id": null, "quantity": 962 },
+      { "row": 2, "col": 1, "item_id": null, "quantity": 1121 },
+      { "row": 2, "col": 2, "item_id": null, "quantity": 952 },
       { "row": 2, "col": 3, "item_id": null, "quantity": 398 },
       { "row": 2, "col": 4, "item_id": null, "quantity": 95 },
-      { "row": 3, "col": 0, "item_id": null, "quantity": 14 },
-      { "row": 3, "col": 1, "item_id": null, "quantity": null },
-      { "row": 3, "col": 2, "item_id": null, "quantity": 2 },
-      { "row": 3, "col": 3, "item_id": null, "quantity": 9 },
-      { "row": 3, "col": 4, "item_id": null, "quantity": 14 }
+      { "row": 3, "col": 0, "item_id": null, "quantity": 1452 },
+      { "row": 3, "col": 1, "item_id": null, "quantity": 607 },
+      { "row": 3, "col": 2, "item_id": null, "quantity": 282 },
+      { "row": 3, "col": 3, "item_id": null, "quantity": 89 },
+      { "row": 3, "col": 4, "item_id": null, "quantity": 1475 }
     ]
   }
 }

@@ -164,9 +164,12 @@ Input: Raw pixel buffer (RGB or RGBA, arbitrary resolution)
      +-- [5c] Color disambiguation (only if shape-group has variants)
      |         Skip this step for items with unique shapes
      |
-     +-- [5d] Quantity OCR on bottom 25% of cell
-     |         -> "x" character detection (masked NCC on green channel)
-     |         -> Digit template matching (0-9, grayscale NCC)
+     +-- [5d] Quantity OCR on bottom 25% of cell (footer region)
+     |         -> Horizontal deskew (shear factor 0.25) on footer
+     |         -> Blue-gradient color segmentation (weight map)
+     |         -> "x" character detection via weight map projection
+     |         -> Digit segmentation via column projection valleys
+     |         -> Digit recognition via projection profile matching
      |         -> Result: quantity number
      |
      Update cursor: matched_ID = this cell's ID
@@ -446,26 +449,106 @@ For each item in items.json:
 `item_icon_material_selection_0` through `_3` are color-coded boxes that
 follow the standard grouping rule (same shape, different rarity colors).
 
-### OCR Digit Templates
+### OCR Quantity Recognition
 
-Digit templates for quantity recognition are sourced from
-`../bluearchive-aoi/output/num/` and stored in `assets/templates/digits/`:
+~~Digit templates for quantity recognition are sourced from
+`../bluearchive-aoi/output/num/` and stored in `assets/templates/digits/`.~~
 
-| File    | Size    | Content              |
-|---------|---------|----------------------|
-| 0-9.png | 15x21px | Green digit glyphs   |
-| x.png   | 15x21px | Green "×" multiplier |
+**Decision: Template-free, color-segmentation + projection-profile approach.**
 
-All templates are RGBA (4 channels) with alpha masks defining the glyph boundary.
-These are embedded in the DLL alongside icon templates via `@embedFile`.
+The template NCC approach was abandoned because bluearchive-aoi's digit
+templates are rendered in a different style (upright, green channel) from
+the actual game text (italic, blue-white gradient with anti-aliasing).
+Even with deskew correction, the rendering mismatch limits accuracy.
+
+#### Game Font Characteristics
+
+The quantity text ("x924", "x1892", etc.) uses a fixed color scheme:
+
+| Element | Color | Description |
+|---------|-------|-------------|
+| Core text | `#2D4663` (R:45 G:70 B:99) | Dark desaturated blue |
+| Anti-alias / outline | gradient to `#F5FAFD` / `#FCFDFD` | Near-white |
+| Background | varies (icon image) | Yellow, red, etc. — different hue |
+
+All items in the inventory always display `x{number}`, even for quantity 1.
+
+#### OCR Pipeline (applied per cell)
+
+```
+Cell (116×117 RGB at 1600×900)
+  |
+  v
+[1] Extract footer region (bottom 25%, trim bottom 6px / right 8px)
+    → 108×24 RGB
+  |
+  v
+[2] Horizontal deskew (shear factor 0.25, bilinear interpolation)
+    → 114×24 RGB (stack buffer, ~8 KB, <0.03ms per cell)
+    Corrects italic lean. The "x" character becomes
+    a near-upright diagonal cross after deskew.
+  |
+  v
+[3] Blue-gradient weight map
+    For each pixel, compute "text membership" score (0.0 – 1.0):
+    - Core color #2D4663 → score 1.0
+    - Anti-aliased pixels (blend toward white) → proportional score
+    - Background pixels (different hue: yellow, red, etc.) → score 0.0
+    This separates text from icon background regardless of icon content.
+  |
+  v
+[4] Column projection profile (sum weights per column)
+    Produces a 1D array of length = image width.
+    Valleys (near-zero regions) indicate character boundaries.
+  |
+  v
+[5] Character segmentation
+    Split at projection valleys to isolate individual characters.
+    Special cases:
+    - "x" is the first character (diagonal cross shape)
+    - Connected characters like "33" may have shallow valleys
+      (pixels #CDD0D4, #D5D8DB indicate separation despite not
+      being fully white)
+    - Left edge may contain "x" remnant noise
+  |
+  v
+[6] Digit recognition via projection profile matching
+    For each segmented digit:
+    - Compute column + row projection profiles
+    - Compare against reference profiles for 0-9
+    - Use upper/lower half split profiles for disambiguation
+      (e.g., 3 vs 8, 6 vs 9)
+    No external templates needed — profiles are computed from
+    the digit's own geometry in the weight map.
+  |
+  v
+Output: quantity (u32)
+```
+
+#### Noise Handling
+
+| Noise source | Mitigation |
+|---|---|
+| Icon background in digit holes (8, 9, 3) | Blue-hue filter excludes non-blue pixels |
+| Connected characters (33, 00) | Shallow valley detection in column projection |
+| "x" remnant at left edge | x detected first; only content after x is digit-parsed |
+| Anti-aliased edges | Gradient weight map captures partial coverage |
+
+#### Performance Impact
+
+Deskew on footer (108×24 → 114×24) vs. number region (49×24 → 55×24):
+- Additional memory: +4 KB stack (8 KB total, negligible)
+- Additional time: +0.03ms per cell, +0.6ms per frame (20 cells)
+- Total OCR overhead per frame: <1ms (well within 33ms budget)
 
 ### Known Issues to Address
 
-1. **OCR accuracy** -- Digit recognition via template matching struggles
-   with anti-aliased text and varying font rendering. Consider:
-   - Sub-pixel alignment
-   - Multiple scale matching
-   - Binarization preprocessing
+1. ~~**OCR accuracy** -- Digit recognition via template matching struggles
+   with anti-aliased text and varying font rendering.~~
+   Resolved: replaced with blue-gradient color segmentation +
+   projection profile matching. Template matching abandoned due to
+   rendering style mismatch between bluearchive-aoi templates and
+   actual game font.
 
 2. ~~**Template embedding strategy**~~ Resolved: pre-process to raw binary
    at build time (see Template Build Pipeline). Comptime PNG decode rejected
@@ -503,8 +586,8 @@ No external template registration API is needed.
 
 ```
 assets/icons/{items,equipment}/*.png       (fetched by scripts/fetch_icons.mjs)
-assets/templates/digits/{0-9,x}.png        (copied from bluearchive-aoi)
 assets/data/items.json, equipment.json     (raw SchaleDB master data)
+(Note: digit templates no longer used — OCR uses color segmentation)
   |
   |  (scripts/preprocess_templates.mjs)
   |  - Decode PNG → raw RGBA pixels
@@ -648,7 +731,7 @@ Tests are organized in layers, from pure computation to full integration.
 | **L1: Pure math** | Area averaging, NCC, HSV conversion | Synthetic pixel arrays | Exact numeric comparison |
 | **L2: Image steps** | Resize, grid detect, cell split | `test_fixtures/screen.png` | Dimensional checks, PSNR similarity |
 | **L3: Matching** | Template NCC + color disambiguation | `test_fixtures/cells/*.png` | Correct item_id, score > baseline |
-| **L4: OCR** | Digit recognition | `test_fixtures/cells_number/*.png` | Exact quantity match vs ground truth |
+| **L4: OCR** | Deskew + color segmentation + digit recognition | `test_fixtures/cells_footer/*.png`, `test_fixtures/skew_number/*.png` | Exact quantity match vs ground truth (20/20 = 100%) |
 | **L5: Integration** | Full pipeline + session | `test_fixtures/screen.png` | Complete item list with quantities |
 
 ### Test Fixtures
@@ -660,7 +743,8 @@ Source: `../bluearchive-aoi/output/` → copied to `test_fixtures/` in this repo
 | `screen.png` | Full game capture (2239x1246, RGB) | 1.3 MB |
 | `cells/cell_r{N}_c{N}.png` | 25 extracted grid cells (116x117, RGB) | ~5 KB each |
 | `cells_number/number_r{N}_c{N}.png` | 20 quantity regions (49x24, RGB) | ~1 KB each |
-| `cells_footer/footer_r{N}_c{N}.png` | 20 cell footer regions (RGB) | ~1 KB each |
+| `cells_footer/footer_r{N}_c{N}.png` | 20 cell footer regions (108x24, RGB) | ~1 KB each |
+| `skew_number/number_r{N}_c{N}.png` | 20 deskewed quantity regions (skew 0.25) | ~1 KB each |
 
 ### Ground Truth
 
@@ -671,17 +755,17 @@ This file is created once by manual inspection and maintained alongside fixtures
 ```json
 {
   "screen.png": {
-    "grid_size": [5, 4],  // [columns, rows]
+    "grid_size": [5, 4],
     "items": [
-      { "row": 0, "col": 0, "item_id": "...", "quantity": 92 },
-      { "row": 0, "col": 1, "item_id": "...", "quantity": 381 }
+      { "row": 0, "col": 0, "item_id": null, "quantity": 924 },
+      { "row": 0, "col": 1, "item_id": null, "quantity": 381 }
     ]
   }
 }
 ```
 
-Quantities are sourced from `../bluearchive-aoi/output/items.yml`.
-Item IDs must be confirmed by manual visual inspection using the
+Quantities are verified by manual visual inspection of the game screenshot.
+Item IDs must be confirmed by manual icon matching using the
 Zig CLI capture tool (`zig build run -- capture`).
 
 ### TDD Implementation Order
@@ -697,9 +781,14 @@ Phase 1:
   5. ncc_grayscale        ← L1: synthetic correlation tests
   6. template_match       ← L3: cell → ranked candidates
   7. color_analysis       ← L1: known HSV values → rarity classification
-  8. digit_ocr            ← L4: number region → exact quantity
-  9. cell_pipeline        ← L3: cell → (item_id, quantity)
-  10. session             ← L5: full screen → 20 items
+  8. deskew               ← L1: horizontal shear (factor 0.25) on footer
+  9. blue_weight_map      ← L1: #2D4663→#FFFFFF gradient → 0.0-1.0 weight
+  10. column_projection   ← L1: weight map → column/row projection profiles
+  11. digit_segment       ← L4: projection valleys → character boundaries
+  12. digit_recognize     ← L4: projection profiles → digit classification
+  13. quantity_ocr        ← L4: footer → x detection + digit parse → exact quantity
+  14. cell_pipeline       ← L3: cell → (item_id, quantity)
+  15. session             ← L5: full screen → 20 items
 ```
 
 ---

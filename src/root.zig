@@ -13,6 +13,9 @@ pub const grid = @import("grid.zig");
 pub const image = @import("image.zig");
 pub const screen = @import("screen.zig");
 pub const ocr = @import("ocr.zig");
+pub const blue_weight = @import("blue_weight.zig");
+pub const projection = @import("projection.zig");
+pub const digit = @import("digit.zig");
 
 test {
     // Pull in all module tests
