@@ -50,8 +50,8 @@ This resolution was chosen because SchaleDB icon templates match cleanly at this
 - Input images are scaled to 1600px width, preserving aspect ratio
 - 16:9 (1.78:1) is the primary supported aspect ratio
 - 4:3 detection exists in bluearchive-aoi but is not yet supported
-- All ROI coordinates are percentage-based (resolution-independent),
-  but template matching requires a fixed pixel scale
+- Grid ROI is detected dynamically via scanline sampling (not percentage-based)
+- Template matching requires a fixed pixel scale (1600px width)
 
 #### D2: Resize Algorithm -- **Area averaging (box filter)**
 
@@ -123,23 +123,20 @@ Input: Raw pixel buffer (RGB or RGBA, arbitrary resolution)
 [1] Downscale to 1600px width (16:9 -> 1600x900)
   |
   v
-[2] Extract grid ROI (percentage-based coordinates)
-     x: 53.2% -- 98.0%    (right side of screen)
-     y: 20.9% -- 84.5%    (middle vertical band)
+[2] Detect grid ROI + cell boundaries (grid.detectGrid)
+     ROI: dynamically detected via scanline sampling for #C4CFD4
+     (no fixed percentage coordinates -- adapts to any aspect ratio)
+     Separator color: #C4CFD4 (tolerance ±15)
+     Min cell size: 50px (noise filter)
   |
   v
-[3] Detect grid cell boundaries
-     Separator color: #C4CFD4
-     Min cell size: 20px (noise filter)
-  |
-  v
-[4] Identify anchor item (top-left cell) -- CRITICAL STEP
+[3] Identify anchor item (top-left cell) -- CRITICAL STEP
      |
-     +-- [4a] Grayscale NCC against ALL templates
+     +-- [3a] Grayscale NCC against ALL templates
      |         -> Produces ranked shape-group candidates
      |         -> e.g. "技術ノート系" (score 0.95), "レポート系" (0.60), ...
      |
-     +-- [4b] Color analysis on top candidates
+     +-- [3b] Color analysis on top candidates
      |         -> Extract dominant hue from icon region (in HSV/Lab space)
      |         -> Disambiguate rarity: gray=T1, blue=T2, gold=T3, purple=T4
      |         -> Result: exact item ID + internal sort order position
@@ -147,24 +144,24 @@ Input: Raw pixel buffer (RGB or RGBA, arbitrary resolution)
      Anchor item established -> internal ID known
   |
   v
-[5] Process remaining cells (left-to-right, top-to-bottom)
+[4] Process remaining cells (left-to-right, top-to-bottom)
      Items are sorted by internal ID (ascending).
      Knowing the anchor ID, each subsequent cell can only be:
        - The same item (duplicate row from scrolling)
        - An item with a HIGHER internal ID
      |
-     +-- [5a] Narrow template candidates using sort order
+     +-- [4a] Narrow template candidates using sort order
      |         Anchor ID = N -> next cell candidates = { ID >= N }
      |         After each match, further narrow: { ID >= matched_ID }
      |         Typically reduces search from ~1000 to ~5-15 templates
      |
-     +-- [5b] Grayscale NCC on narrowed set
+     +-- [4b] Grayscale NCC on narrowed set
      |         Much faster due to small candidate pool
      |
-     +-- [5c] Color disambiguation (only if shape-group has variants)
+     +-- [4c] Color disambiguation (only if shape-group has variants)
      |         Skip this step for items with unique shapes
      |
-     +-- [5d] Quantity OCR on bottom 25% of cell (footer region)
+     +-- [4d] Quantity OCR on bottom 25% of cell (footer region)
      |         -> Horizontal deskew (shear factor 0.25) on footer
      |         -> Blue-gradient color segmentation (weight map)
      |         -> "x" character detection via weight map projection
@@ -400,19 +397,18 @@ Session result: {A, B, C, ... AI} with quantities -- complete inventory
    - Session ends when the user navigates away or explicitly ends it
    - The accumulated result contains the complete item list
 
-### Key Constants (from bluearchive-aoi)
+### Key Constants
 
 | Constant          | Value      | Source file        |
 |-------------------|------------|--------------------|
-| BASE_WIDTH        | 1600       | items.rs:37        |
-| TEMPLATE_SIZE     | 80x80      | icon_registry.rs:11|
-| Match threshold   | 0.5        | template_match.rs  |
-| Separator color   | #C4CFD4    | grid_detect.rs     |
-| Grid ROI x        | 53.2%-98%  | grid_detect.rs:6-7 |
-| Grid ROI y        | 20.9%-84.5%| grid_detect.rs:8-9 |
-| Qty region start  | 75% of cell| grid_detect.rs:34  |
-| Qty trim bottom   | 6px        | grid_detect.rs:36  |
-| Qty trim right    | 8px        | grid_detect.rs:37  |
+| BASE_WIDTH        | 1600       | image.zig:canonical_width |
+| TEMPLATE_SIZE     | 80x80      | grid.zig:template_size    |
+| Match threshold   | 0.5        | (TBD: ncc.zig)           |
+| Separator color   | #C4CFD4    | grid.zig            |
+| Grid ROI          | dynamic    | grid.zig:findGridRegion (scanline detection, no fixed %) |
+| Qty region start  | 75% of cell| grid.zig:qty_region_start |
+| Qty trim bottom   | 6px        | grid.zig:qty_trim_bottom  |
+| Qty trim right    | 8px        | grid.zig:qty_trim_right   |
 
 ### Shape-Group Definition
 
@@ -560,8 +556,8 @@ Deskew on footer (108×24 → 114×24) vs. number region (49×24 → 55×24):
 
 **Decision: Pre-processed raw binary, embedded at compile time**
 
-Templates (SchaleDB icon images) are pre-processed by a Node.js build script
-into raw binary format, then embedded in the DLL via Zig's `@embedFile`.
+Templates (SchaleDB icon images) are pre-processed into raw binary format,
+then embedded in the DLL via Zig's `@embedFile`.
 No external template registration API is needed.
 
 ### Rationale
@@ -585,12 +581,12 @@ No external template registration API is needed.
 ### Template Build Pipeline
 
 ```
-assets/icons/{items,equipment}/*.png       (fetched by scripts/fetch_icons.mjs)
+assets/icons/{items,equipment}/*.webp      (fetched by zig build fetch-icons)
 assets/data/items.json, equipment.json     (raw SchaleDB master data)
 (Note: digit templates no longer used — OCR uses color segmentation)
   |
-  |  (scripts/preprocess_templates.mjs)
-  |  - Decode PNG → raw RGBA pixels
+  |  (TBD: Zig preprocess tool)
+  |  - Decode WebP → raw RGBA pixels
   |  - Resize to 80x80 (area averaging)
   |  - Convert to grayscale + alpha mask
   |  - Generate shape-group metadata from master data
@@ -766,7 +762,7 @@ This file is created once by manual inspection and maintained alongside fixtures
 
 Quantities are verified by manual visual inspection of the game screenshot.
 Item IDs must be confirmed by manual icon matching using the
-Zig CLI capture tool (`zig build run -- capture`).
+Zig CLI scan tool (`zig build run -- scan --dump`).
 
 ### TDD Implementation Order
 
@@ -795,44 +791,10 @@ Phase 1:
 
 ## Developer Tools
 
-### `shittim capture` -- Game Window Screenshot Capture (Zig CLI)
+### `shittim scan` -- Capture & Analyze (Zig CLI)
 
-A subcommand of the Zig CLI (`zig build run -- capture`) for capturing
-the Blue Archive game window's client area as a clean screenshot.
-
-**Purpose**: Generate test fixture images for ground truth labeling.
-The captured image must match what bluearchive-aoi's Windows Graphics Capture API
-would produce -- the client area pixels only, without OS window decorations.
-
-#### Usage
-
-```bash
-zig build run -- capture [options]
-
-Options:
-  --window-title <string>   Window title to capture (default: "BlueArchive")
-  --output <path>           Output PNG path (default: "test_fixtures/screen.png")
-  --display-scale <float>   Display scaling factor (default: auto-detect)
-  --list-windows            List all visible windows and exit
-```
-
-#### Implementation Notes
-
-**Client area capture via Win32 API:**
-Uses `GetClientRect` + `ClientToScreen` + `BitBlt` to capture only the
-client area, excluding title bar and window chrome.
-
-- `GetDpiForWindow` for automatic DPI detection
-- `--display-scale` as manual fallback
-- Output: RGB PNG (alpha removed)
-
-**Platform**: Windows 11 only. Implemented using Zig's `@cImport` of
-`windows.h` for direct Win32 API access (no PowerShell or Node.js).
-
-### `shittim scan` -- Single-shot Scan (Zig CLI)
-
-A subcommand for analyzing a screenshot and printing results to stdout
-in YAML format. Intended for standalone CLI usage and debugging.
+The primary CLI subcommand. Captures the game window in real-time,
+detects the grid, runs OCR on each cell, and outputs results as CSV.
 
 #### Usage
 
@@ -840,48 +802,80 @@ in YAML format. Intended for standalone CLI usage and debugging.
 zig build run -- scan [options]
 
 Options:
-  --input <path>    Input PNG image (default: stdin as raw pixels)
-  --format <fmt>    Output format: yaml (default), json
+  --title <string>    Window title to find (default: auto-detect "BlueArchive")
+  --list-windows      List all visible windows and exit
+  --dump [path]       Save captured image as PPM for debugging (default: capture.ppm)
 ```
+
+#### Implementation Notes
+
+**Window capture via Win32 API:**
+Uses `FindWindow` + `PrintWindow` / `BitBlt` to capture the game window's
+client area. Auto-detects "BlueArchive" or "ブルーアーカイブ" window titles.
+
+**Pipeline:**
+1. Capture game window → raw RGB pixels
+2. Normalize to 1600px width (area averaging)
+3. Detect grid (`grid.detectGrid`) → cell coordinates + ROI
+4. Classify screen (`screen.classify`) using ROI from step 3
+5. OCR each cell's footer region → quantity
+6. Output CSV to stdout: `row,col,quantity`
+
+**Platform**: Windows 11 only. Implemented using Zig's `@cImport` of
+`windows.h` for direct Win32 API access.
 
 #### Example Output
 
-```yaml
-screen_type: item_inventory
-grid_size: [5, 4]  # [columns, rows]
-items:
-  - icon: item_icon_expitem_0
-    name: 初級強化珠
-    quantity: 92
-    match_score: 0.95
-  - icon: item_icon_expitem_1
-    name: 中級強化珠
-    quantity: 381
-    match_score: 0.93
-  - icon: item_icon_skillbook_selection_0   # merge group: 3 cells summed
-    name: 初級技術ノート選択ボックス
-    quantity: 29                             # 8 + 12 + 9
-    match_score: 0.94
-    merged_cells: 3
+```csv
+row,col,quantity
+0,0,924
+0,1,381
+0,2,29
+0,3,12
+0,4,8
+1,0,500
+...
 ```
 
-Merge group items are automatically aggregated: quantities are summed
-and `merged_cells` indicates how many cells were combined.
+Currently outputs OCR quantities only (template matching not yet implemented).
+Once template matching is added, output will include item IDs.
 
-YAML is the default output format for human readability.
-The C ABI (DLL) does not include serialization -- Rust callers
-receive results via `ShittimItem` structs directly.
+### `zig build fetch-icons` -- Icon Downloader (Standalone Zig Tool)
+
+Downloads item and equipment icons from SchaleDB. Saves master data JSON
+and icon images (.webp) to `assets/`.
+
+```bash
+zig build fetch-icons [-- --items-only | --equipment-only]
+```
+
+No library or zigimg dependency required (HTTP only, saves raw WebP files).
+
+### `zig build split-cells` -- Cell Splitter (Zig Tool, requires zigimg)
+
+Splits a cropped grid image into individual cell PNGs for test fixture generation.
+
+```bash
+zig build split-cells -- <input.png> [output_dir]
+```
+
+Requires zigimg (lazy dependency, fetched automatically on first use).
 
 ---
 
 ## Next Steps
 
 1. ~~Review this spec and refine API surface~~ ✓
-2. ~~Copy OCR digit templates to `assets/templates/digits/`~~ ✓
+2. ~~Copy OCR digit templates to `assets/templates/digits/`~~ ✓ (abandoned: OCR uses color segmentation)
 3. ~~Install Zig toolchain~~ ✓ (Zig 0.15.2 via winget)
 4. ~~Create `build.zig` project scaffold~~ ✓ (lib module + CLI exe + tests)
-5. Build `shittim capture` subcommand (Zig CLI, Win32 API)
-6. Capture screenshots and finalize `test_fixtures/ground_truth.json` (item_id manual labeling)
-7. Implement Phase 0 foundation (resize + screen classifier) via TDD
-8. Implement Phase 1 item inventory pipeline via TDD
-9. Integration test with ground truth data
+5. ~~Build `shittim scan` subcommand (window capture + grid + OCR)~~ ✓
+6. ~~Implement Phase 0 foundation (resize + screen classifier)~~ ✓
+7. ~~Implement OCR pipeline (deskew + blue weight + projection + digit classify)~~ ✓
+8. Populate OCR test fixtures and achieve 99%+ accuracy on 16:9 screenshots
+9. Fix OCR accuracy on 4:3 aspect ratio images
+10. Build template preprocess tool (WebP decode → grayscale + alpha mask → binary)
+11. Implement template matching (grayscale NCC + color disambiguation)
+12. Implement session management (continuous scroll capture)
+13. Finalize `test_fixtures/ground_truth.json` (item_id manual labeling)
+14. Integration test with ground truth data

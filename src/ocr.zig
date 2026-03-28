@@ -14,9 +14,10 @@ const digit_mod = @import("digit.zig");
 const skew_factor: f32 = 0.25;
 
 // Max deskewed image dimensions for stack buffer.
-// Number regions are ~49x24; after shear the width grows by ceil(0.25 * height).
-const max_deskew_src_w: u32 = 80;
-const max_deskew_src_h: u32 = 40;
+// Number regions: ~49x24 (16:9) or ~122x32 (4:3).
+// After shear the width grows by ceil(0.25 * height).
+const max_deskew_src_w: u32 = 140;
+const max_deskew_src_h: u32 = 50;
 const max_deskew_dst_w: u32 = max_deskew_src_w + max_deskew_src_h;
 const max_deskew_buf_size: u32 = max_deskew_dst_w * max_deskew_src_h * 3;
 
@@ -194,3 +195,45 @@ pub fn parseQuantity(
 
 // Integration tests live in test/ocr_test.zig (separate module to keep
 // test fixture data out of the src/ package path).
+
+// ── Unit tests ──
+
+test "deskew: output width increases by ceil(skew_factor * height)" {
+    // 4x2 image, skew_factor=0.25 → extra = ceil(0.25 * 2) = 1 → dst_w = 5
+    const pixels = [_]u8{
+        255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128, // row 0: R, G, B, gray
+        64,  64, 64, 32, 32, 32, 16, 16, 16, 8, 8, 8, // row 1
+    };
+    var buf: [5 * 2 * 3]u8 = undefined;
+    const result = deskew(&buf, &pixels, 4, 2);
+    try std.testing.expectEqual(@as(u32, 5), result.w);
+    try std.testing.expectEqual(@as(usize, 5 * 2 * 3), result.pixels.len);
+    // Row 0 (shift=0): first pixel should be original (255, 0, 0)
+    try std.testing.expectEqual(@as(u8, 255), result.pixels[0]);
+    try std.testing.expectEqual(@as(u8, 0), result.pixels[1]);
+    try std.testing.expectEqual(@as(u8, 0), result.pixels[2]);
+}
+
+test "deskew: 1x1 image preserves pixel" {
+    const pixels = [_]u8{ 100, 150, 200 };
+    // extra = ceil(0.25 * 1) = 1 → dst_w = 2
+    var buf: [2 * 1 * 3]u8 = undefined;
+    const result = deskew(&buf, &pixels, 1, 1);
+    try std.testing.expectEqual(@as(u32, 2), result.w);
+    // First pixel at (0,0): shift=0, src_xf=0.0 → copies original
+    try std.testing.expectEqual(@as(u8, 100), result.pixels[0]);
+    try std.testing.expectEqual(@as(u8, 150), result.pixels[1]);
+    try std.testing.expectEqual(@as(u8, 200), result.pixels[2]);
+}
+
+test "recognizeDigits: all-black returns null" {
+    var pixels: [30 * 10 * 3]u8 = undefined;
+    @memset(&pixels, 0);
+    try std.testing.expect(recognizeDigits(&pixels, 30, 10) == null);
+}
+
+test "recognizeDigits: all-white returns null" {
+    var pixels: [30 * 10 * 3]u8 = undefined;
+    @memset(&pixels, 255);
+    try std.testing.expect(recognizeDigits(&pixels, 30, 10) == null);
+}

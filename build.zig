@@ -33,6 +33,18 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // ── Dev tools ──
+
+    // fetch-icons: HTTP only, no library dependencies
+    addStandaloneDevTool(b, "fetch-icons", "Download icons from SchaleDB", "tools/fetch_icons.zig");
+
+    // Tools requiring zigimg (lazy dependency, fetched only when step is invoked)
+    if (b.lazyDependency("zigimg", .{})) |dep| {
+        const zigimg = dep.module("zigimg");
+        // split-cells: extract individual cell PNGs from a cropped grid image
+        addDevTool(b, lib_mod, zigimg, "split-cells", "Split grid image into cell PNGs", "tools/split_cells.zig");
+    }
+
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");
 
@@ -64,4 +76,48 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(ocr_tests).step);
+}
+
+fn addStandaloneDevTool(
+    b: *std.Build,
+    step_name: []const u8,
+    description: []const u8,
+    source: []const u8,
+) void {
+    const tool_exe = b.addExecutable(.{
+        .name = step_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = b.graph.host,
+        }),
+    });
+    const step = b.step(step_name, description);
+    const run = b.addRunArtifact(tool_exe);
+    if (b.args) |args| run.addArgs(args);
+    step.dependOn(&run.step);
+}
+
+fn addDevTool(
+    b: *std.Build,
+    lib_mod: *std.Build.Module,
+    zigimg: *std.Build.Module,
+    step_name: []const u8,
+    description: []const u8,
+    source: []const u8,
+) void {
+    const tool_exe = b.addExecutable(.{
+        .name = step_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = b.graph.host,
+            .imports = &.{
+                .{ .name = "shittim_reader", .module = lib_mod },
+                .{ .name = "zigimg", .module = zigimg },
+            },
+        }),
+    });
+    const step = b.step(step_name, description);
+    const run = b.addRunArtifact(tool_exe);
+    if (b.args) |args| run.addArgs(args);
+    step.dependOn(&run.step);
 }

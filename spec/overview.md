@@ -53,8 +53,8 @@ By extracting the image analysis pipeline into a Zig library, we gain:
 **shittim-reader provides:**
 - Image analysis pipeline (the core value)
 - Icon templates embedded in DLL at build time
-  (fetched from SchaleDB via `scripts/fetch_icons.mjs`,
-  preprocessed via `scripts/preprocess_templates.mjs`, embedded via `@embedFile`)
+  (fetched from SchaleDB via `zig build fetch-icons`,
+  preprocessed to raw binary (TBD: Zig tool), embedded via `@embedFile`)
 - Exported as a Windows DLL with C ABI
 
 ## Design Decisions (Summary)

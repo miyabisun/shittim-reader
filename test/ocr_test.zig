@@ -8,7 +8,12 @@ const std = @import("std");
 const shittim = @import("shittim_reader");
 const ocr_fixtures = @import("ocr_fixtures");
 
-test "recognizeDigits matches all 20 ground truth values" {
+test "recognizeDigits matches all ground truth values" {
+    if (ocr_fixtures.fixtures.len == 0) {
+        std.debug.print("\nSKIP: no OCR fixtures loaded (populate test_fixtures/ocr_fixtures.zig)\n", .{});
+        return error.SkipZigTest;
+    }
+
     var correct: u32 = 0;
     var total: u32 = 0;
 
@@ -31,7 +36,12 @@ test "recognizeDigits matches all 20 ground truth values" {
     try std.testing.expectEqual(total, correct);
 }
 
-test "parseQuantity matches all 20 ground truth values (with deskew)" {
+test "parseQuantity matches all ground truth values (with deskew)" {
+    if (ocr_fixtures.number_fixtures.len == 0) {
+        std.debug.print("\nSKIP: no parseQuantity fixtures loaded (populate test_fixtures/ocr_fixtures.zig)\n", .{});
+        return error.SkipZigTest;
+    }
+
     var correct: u32 = 0;
     var total: u32 = 0;
 

@@ -62,7 +62,7 @@ pub fn blueWeight(r: u8, g: u8, b: u8) f32 {
 }
 
 /// Maximum weight map size (pixels) for stack allocation.
-pub const max_weight_map_size: u32 = 200 * 40;
+pub const max_weight_map_size: u32 = 200 * 50;
 
 /// Compute weight map for an RGB image. Writes into `buf`.
 pub fn computeWeightMap(buf: []f32, pixels: []const u8, w: u32, h: u32) []f32 {

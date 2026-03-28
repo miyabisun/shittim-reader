@@ -1,6 +1,6 @@
 //! Screen classifier: identifies the current game screen type.
 //!
-//! Uses key-region sampling to classify screens without analyzing the full image.
+//! Uses grid region detection and sidebar sampling to classify screens.
 //! Currently supports: ITEM_INVENTORY detection.
 
 const std = @import("std");
@@ -11,38 +11,18 @@ pub const ScreenType = enum {
     unknown,
 };
 
-/// Classify the screen type from a normalized 1600×900 RGB image.
+/// Classify the screen type from an RGB image.
 ///
 /// For item_inventory detection:
-/// - Check that the right side (~53-98% x) contains separator-colored pixels
-/// - Sample multiple probe points in the grid ROI area
-pub fn classify(pixels: []const u8, width: u32, height: u32) ScreenType {
+/// - Check that the right half contains a #C4CFD4 grid region (via roi parameter)
+/// - Verify the left side has sidebar-like chrome (non-extreme, low saturation)
+///
+/// Pass `roi` from `grid.detectGrid().roi` or `grid.findGridRegion()` to avoid
+/// redundant grid region detection.
+pub fn classify(pixels: []const u8, width: u32, height: u32, roi: ?grid_mod.RoiBounds) ScreenType {
     if (pixels.len < @as(usize, width) * height * 3) return .unknown;
 
-    const bounds = grid_mod.roiBounds(width, height);
-    const roi_h = bounds.y1 - bounds.y0;
-
-    // Check for separator color at several horizontal scan lines across the ROI
-    var sep_hits: u32 = 0;
-    const n_probes: u32 = 10;
-    for (0..n_probes) |i| {
-        const y = bounds.y0 + @as(u32, @intCast(i)) * roi_h / n_probes;
-        var line_hits: u32 = 0;
-        const scan_count: u32 = 20;
-        for (0..scan_count) |j| {
-            const x = bounds.x0 + @as(u32, @intCast(j)) * (bounds.x1 - bounds.x0) / scan_count;
-            const idx = (@as(usize, y) * width + x) * 3;
-            if (idx + 2 < pixels.len) {
-                if (grid_mod.isSeparatorRgb(pixels[idx], pixels[idx + 1], pixels[idx + 2])) {
-                    line_hits += 1;
-                }
-            }
-        }
-        // A scan line with >50% separator pixels counts as a separator hit
-        if (line_hits > scan_count / 2) {
-            sep_hits += 1;
-        }
-    }
+    const has_grid = roi != null;
 
     // Check left sidebar: item inventory has a non-extreme background
     // at x ~15%, y ~50% (not pure black/white, and has low-to-mid saturation)
@@ -54,15 +34,12 @@ pub fn classify(pixels: []const u8, width: u32, height: u32) ScreenType {
         const r = pixels[sidebar_idx];
         const g = pixels[sidebar_idx + 1];
         const b = pixels[sidebar_idx + 2];
-        // Sidebar should be non-extreme: all channels in a moderate range
-        // AND not a saturated primary color (which would indicate game content, not sidebar chrome)
         const min_ch = @min(r, @min(g, b));
         const max_ch = @max(r, @max(g, b));
         has_sidebar = min_ch > 30 and max_ch < 240 and (max_ch - min_ch) < 80;
     }
 
-    // Need at least 2 separator line hits and sidebar presence
-    if (sep_hits >= 2 and has_sidebar) return .item_inventory;
+    if (has_grid and has_sidebar) return .item_inventory;
 
     return .unknown;
 }
@@ -77,7 +54,8 @@ test "all black → unknown" {
     defer alloc.free(pixels);
     @memset(pixels, 0);
 
-    try std.testing.expectEqual(ScreenType.unknown, classify(pixels, w, h));
+    const roi = grid_mod.findGridRegion(pixels, w, h);
+    try std.testing.expectEqual(ScreenType.unknown, classify(pixels, w, h, roi));
 }
 
 test "synthetic inventory screen → item_inventory" {
@@ -90,20 +68,87 @@ test "synthetic inventory screen → item_inventory" {
     // Fill with mid-gray background (simulates sidebar)
     @memset(pixels, 128);
 
-    // Draw separator lines across the grid ROI
-    const bounds = grid_mod.roiBounds(1600, 900);
-    const roi_h = bounds.y1 - bounds.y0;
+    // Draw separator lines that the scanline algorithm will detect:
+    // - Horizontal scanline at y=450 must hit #C4CFD4 runs in right half
+    // - Vertical scanline at x0+9 must hit a continuous #C4CFD4 strip
+    const grid_x0: u32 = 845;
+    const grid_x1: u32 = 1568;
+    const grid_y0: u32 = 187;
+    const grid_y1: u32 = 760;
 
-    // Draw 5 horizontal separator lines evenly spaced
-    for (0..5) |i| {
-        const y = bounds.y0 + @as(u32, @intCast(i)) * roi_h / 5;
-        for (bounds.x0..bounds.x1) |x| {
+    // Left border: 20px wide strip (x0+9 falls inside this)
+    for (grid_y0..grid_y1) |y| {
+        for (grid_x0..grid_x0 + 20) |x| {
             const idx = (@as(usize, y) * w + x) * 3;
             pixels[idx] = 0xC4;
             pixels[idx + 1] = 0xCF;
             pixels[idx + 2] = 0xD4;
         }
     }
+    // Horizontal separator lines (3px tall) — one must cross y=450
+    for ([_]u32{ grid_y0, 330, 448, grid_y1 - 3 }) |y| {
+        for (grid_x0..grid_x1) |x| {
+            for (0..3) |dy| {
+                const idx = ((@as(usize, y) + dy) * w + x) * 3;
+                pixels[idx] = 0xC4;
+                pixels[idx + 1] = 0xCF;
+                pixels[idx + 2] = 0xD4;
+            }
+        }
+    }
+    // Internal vertical separators + right border
+    for ([_]u32{ 990, 1130, 1270, 1410, grid_x1 - 3 }) |x| {
+        for (grid_y0..grid_y1) |y| {
+            for (0..3) |dx| {
+                const idx = (@as(usize, y) * w + x + dx) * 3;
+                pixels[idx] = 0xC4;
+                pixels[idx + 1] = 0xCF;
+                pixels[idx + 2] = 0xD4;
+            }
+        }
+    }
 
-    try std.testing.expectEqual(ScreenType.item_inventory, classify(pixels, w, h));
+    const roi = grid_mod.findGridRegion(pixels, w, h);
+    try std.testing.expect(roi != null);
+    try std.testing.expectEqual(ScreenType.item_inventory, classify(pixels, w, h, roi));
+}
+
+test "grid present but no sidebar → unknown" {
+    const alloc = std.testing.allocator;
+    const w: u32 = 1600;
+    const h: u32 = 900;
+    const pixels = try alloc.alloc(u8, w * h * 3);
+    defer alloc.free(pixels);
+
+    // Pure black background (fails sidebar check: min_ch <= 30)
+    @memset(pixels, 0);
+
+    // Draw grid separator structures (same as inventory test)
+    const grid_x0: u32 = 845;
+    const grid_x1: u32 = 1568;
+    const grid_y0: u32 = 187;
+    const grid_y1: u32 = 760;
+
+    for (grid_y0..grid_y1) |y| {
+        for (grid_x0..grid_x0 + 20) |x| {
+            const idx = (@as(usize, y) * w + x) * 3;
+            pixels[idx] = 0xC4;
+            pixels[idx + 1] = 0xCF;
+            pixels[idx + 2] = 0xD4;
+        }
+    }
+    for ([_]u32{ grid_y0, 330, 448, grid_y1 - 3 }) |y| {
+        for (grid_x0..grid_x1) |x| {
+            for (0..3) |dy| {
+                const idx = ((@as(usize, y) + dy) * w + x) * 3;
+                pixels[idx] = 0xC4;
+                pixels[idx + 1] = 0xCF;
+                pixels[idx + 2] = 0xD4;
+            }
+        }
+    }
+
+    const roi = grid_mod.findGridRegion(pixels, w, h);
+    try std.testing.expect(roi != null); // grid IS detected
+    try std.testing.expectEqual(ScreenType.unknown, classify(pixels, w, h, roi)); // but no sidebar
 }

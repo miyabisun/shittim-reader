@@ -23,7 +23,7 @@ pub const max_segments: u32 = 8;
 pub const max_profile_w: u32 = 200;
 
 /// Maximum image height for stack-allocated profile buffers.
-pub const max_profile_h: u32 = 40;
+pub const max_profile_h: u32 = 50;
 
 /// Compute column projection: sum of weights per column.
 pub fn columnProjection(weight_map: []const f32, w: u32, h: u32, buf: []f32) []f32 {
@@ -169,15 +169,24 @@ test "segmentCharacters finds three segments" {
 }
 
 test "normalizeProfile resamples to fixed length" {
+    // Input: {2, 4, 6, 4, 2}, sum=18. 3 bins sample at positions 0, 2, 4.
+    // Raw: {2/18, 6/18, 2/18} = {0.1111, 0.3333, 0.1111}, sum=0.5556
+    // Re-normalized: each /= 0.5556 → {0.2, 0.6, 0.2}
     const src = [_]f32{ 2.0, 4.0, 6.0, 4.0, 2.0 };
     var dest: [3]f32 = undefined;
     normalizeProfile(&src, &dest);
-    // Sum should be approximately 1.0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), dest[0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), dest[1], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), dest[2], 1e-3);
+    // Sum must be 1.0 after re-normalization
     var sum: f32 = 0;
     for (dest) |v| sum += v;
-    // Not exactly 1.0 because we sample at discrete points, but close
-    try std.testing.expect(sum > 0.5);
-    // Middle should be highest
-    try std.testing.expect(dest[1] > dest[0]);
-    try std.testing.expect(dest[1] > dest[2]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+}
+
+test "normalizeProfile empty input gives zeros" {
+    const src = [_]f32{};
+    var dest: [3]f32 = undefined;
+    normalizeProfile(&src, &dest);
+    for (dest) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
 }
