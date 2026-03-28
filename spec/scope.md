@@ -34,11 +34,11 @@ Rather than designing for all screen types upfront, we should define:
 
 These capabilities are prerequisites regardless of which screen we analyze:
 
-- [ ] **Image input** -- Accept raw pixel buffer (RGBA/RGB) with dimensions
-- [ ] **Resize/normalize** -- Scale arbitrary window size to canonical resolution
-      with consistent quality (current pain point in bluearchive-aoi)
-- [ ] **Screen state classifier** -- Determine which screen type is currently shown
-      (even if only to say "unknown / not supported yet")
+- **Image input** -- Accept raw pixel buffer (RGB or RGBA) with dimensions
+- **Resize/normalize** -- Scale arbitrary window size to canonical resolution
+  with consistent quality (current pain point in bluearchive-aoi)
+- **Screen state classifier** -- Determine which screen type is currently shown
+  (even if only to say "unknown / not supported yet")
 
 ### Design Decisions (Phase 0)
 
@@ -53,25 +53,32 @@ This resolution was chosen because SchaleDB icon templates match cleanly at this
 - All ROI coordinates are percentage-based (resolution-independent),
   but template matching requires a fixed pixel scale
 
-#### D2: Resize Algorithm -- **To be determined (key R&D area)**
+#### D2: Resize Algorithm -- **Area averaging (box filter)**
 
-bluearchive-aoi currently uses `FilterType::Triangle` (similar to bilinear) for both:
-- Full-screen downscale (arbitrary size -> 1600px width)
-- Cell icon resize (cell crop -> 80x80px for template matching)
+bluearchive-aoi currently uses `FilterType::Triangle` (similar to bilinear) for both
+full-screen downscale and cell icon resize. This causes inconsistent results because
+bilinear interpolation samples specific points, and the sampling positions shift
+depending on source resolution -- leading to different pixel patterns for the same
+content at different window sizes.
 
-This is a known pain point -- quality is inconsistent. Zig implementation should
-experiment with multiple algorithms:
+**Decision: Area averaging for all downscale operations.**
 
-| Algorithm        | Pros                     | Cons                      | Use case        |
-|------------------|--------------------------|---------------------------|-----------------|
-| Bilinear         | Fast, smooth             | Blurs fine detail         | Downscale       |
-| Lanczos-3        | Sharp, high quality      | Ringing artifacts, slower | Downscale       |
-| Area averaging   | Natural downscale        | Not for upscale           | Downscale only  |
-| Nearest neighbor | Preserves hard edges     | Aliasing                  | Mask/binary     |
+Area averaging computes each output pixel as the weighted mean of ALL input pixels
+that overlap the output pixel's area. This makes it resolution-independent:
+the same downscale ratio always produces the same result regardless of source size.
+This is critical for OCR digit matching, where consistent pixel collapse patterns
+directly affect template matching accuracy.
 
-**Strategy**: Implement multiple algorithms, benchmark quality + speed,
-choose per use case (e.g., Lanczos for screen downscale, area averaging for
-icon crop, nearest for alpha masks).
+| Use case              | Algorithm       | Rationale                                |
+|-----------------------|-----------------|------------------------------------------|
+| Screen downscale      | Area averaging  | Consistent quality at any source size    |
+| Cell icon resize      | Area averaging  | Same pixels → same template match scores |
+| Alpha mask resize     | Nearest neighbor| Preserve binary edge information         |
+
+**Why not Lanczos?** Lanczos produces sharper results but introduces ringing
+artifacts (bright/dark halos at edges). For small template images (80x80) and
+tiny digit glyphs (15x21), these halos corrupt the NCC correlation and reduce
+matching accuracy.
 
 #### D3: Screen Classifier -- **Key-region sampling approach**
 
@@ -110,7 +117,7 @@ The item inventory screen is the first target. It has the highest value
 ### Pipeline (redesigned for shittim-reader)
 
 ```
-Input: Raw pixel buffer (RGBA, arbitrary resolution)
+Input: Raw pixel buffer (RGB or RGBA, arbitrary resolution)
   |
   v
 [1] Downscale to 1600px width (16:9 -> 1600x900)
@@ -158,8 +165,8 @@ Input: Raw pixel buffer (RGBA, arbitrary resolution)
      |         Skip this step for items with unique shapes
      |
      +-- [5d] Quantity OCR on bottom 25% of cell
-     |         -> "x" character detection (masked RGB NCC)
-     |         -> Digit template matching (0-9)
+     |         -> "x" character detection (masked NCC on green channel)
+     |         -> Digit template matching (0-9, grayscale NCC)
      |         -> Result: quantity number
      |
      Update cursor: matched_ID = this cell's ID
@@ -212,6 +219,71 @@ Cell[3,4] = last       -> candidates: ID >= 1180     -> ~3 templates
 Average candidates per cell: ~10 (vs ~1000 without optimization)
 Speedup: ~100x
 ```
+
+### Merge Groups and Cell Map Inference
+
+#### The Problem
+
+Some items share an identical `Icon` but have different internal IDs.
+These are visually indistinguishable via template matching.
+
+```
+Example: 初級技術ノート選択ボックス (skillbook_selection_0)
+  ID 150000 — 全学園用
+  ID 150012 — Aグループ用
+  ID 150016 — Bグループ用
+  → Same icon, same shape, same rarity color. NCC cannot differentiate.
+```
+
+This pattern exists for:
+- 技術ノート選択ボックス: 4 rarities × 3 sets = 12 items
+- 戦術教育BD選択ボックス: 4 rarities × 3 sets = 12 items
+- (Plus event items, which are filtered out of the inventory)
+
+#### Merge Group Definition
+
+A **merge group** is a set of items sharing the same `Icon` string.
+Detected automatically from master data during catalog generation.
+
+- Items within a merge group are summed into a single output entry
+- The merge key is the `Icon` value (not the `Id`)
+- Items with unique Icons (1 ID per Icon) need no merging
+
+#### Cell Map Inference (Row Skip Optimization)
+
+Items are displayed in internal ID ascending order, with unowned items
+hidden (gaps in the sequence). When processing a row:
+
+1. **Identify the first cell** via full template matching (grayscale NCC)
+2. **Check if subsequent cells belong to the same merge group:**
+   - Same merge group → skip template matching, OCR quantity only
+   - Different icon → template match as normal (but candidate set is
+     narrowed by sort order)
+3. **Sum quantities** across all cells in the merge group
+
+```
+Example: Row contains 3 技術ノート選択ボックス (初級) at IDs 150000, 150012, 150016
+
+Cell[r,0]: template match → skillbook_selection_0 (merge group detected)
+Cell[r,1]: same icon → skip match, OCR → quantity = 5
+Cell[r,2]: same icon → skip match, OCR → quantity = 12
+Cell[r,3]: different icon → template match → next item
+Cell[r,4]: ...
+
+Output: skillbook_selection_0: quantity = (cell0 qty) + 5 + 12
+```
+
+This optimization is especially effective for selection boxes, which
+appear as 3 consecutive cells with identical icons. For most other items,
+the sort-order optimization already limits candidates to <15 templates,
+so the additional speedup is smaller but still beneficial.
+
+#### Correctness Note
+
+Cell map inference is **not** a guarantee -- unowned items create gaps.
+The system must fall back to template matching if the expected merge group
+member is not found at the next cell position. The inference is a fast path,
+not a hard assumption.
 
 ### Continuous Scroll Capture (Streaming Mode)
 
@@ -282,9 +354,9 @@ Session result: {A, B, C, ... AI} with quantities -- complete inventory
    - Any line differs -> frame changed -> proceed to pipeline
    - All lines match  -> identical frame -> skip (return 0)
 
-   Memory: 5 horizontal lines (width * 4 bytes each)
-         + 5 vertical lines (height * 4 bytes each)
-         @ 1920x1080: 5*1920*4 + 5*1080*4 = ~59 KB
+   Memory: 5 horizontal lines (width * channels bytes each)
+         + 5 vertical lines (height * channels bytes each)
+         @ 1920x1080 RGBA: 5*1920*4 + 5*1080*4 = ~59 KB
    ```
 
    The session stores only these 10 sampled lines from the previous frame.
@@ -339,60 +411,140 @@ Session result: {A, B, C, ... AI} with quantities -- complete inventory
 | Qty trim bottom   | 6px        | grid_detect.rs:36  |
 | Qty trim right    | 8px        | grid_detect.rs:37  |
 
+### Shape-Group Definition
+
+Items with tier variants (`_0`/`_1`/`_2`/`_3` suffix) share the same icon shape
+but differ by color (rarity). These must be pre-grouped at compile time so that
+the matching pipeline knows when to apply color disambiguation.
+
+**Grouping rules (applied during build-time metadata generation):**
+
+```
+For each item in items.json:
+
+1. If SubCategory == "Artifact" (オーパーツ):
+   → Do NOT group. Each tier has a completely different image
+     (broken → restored progression). Treat all 4 tiers as independent templates.
+   → 20 artifact families × 4 tiers = 80 independent templates.
+
+2. If Category == "Favor" (贈り物):
+   → Only upper/supreme tiers exist (SR/SSR). Shapes are distinct enough
+     that grayscale NCC alone can distinguish them. Grouping is unnecessary
+     in practice, but apply the standard rule if _0/_1/_2/_3 variants exist.
+
+3. Otherwise, if Icon name has _0/_1/_2/_3 tier variants:
+   → Group by base name (Icon without trailing _N suffix).
+   → Use _0 (T1/Normal) as the shape representative template for grayscale NCC.
+   → After shape match, apply color disambiguation (gray/blue/gold/purple).
+   → This applies to: skill books, EX skill CDs, selection boxes, EXP items, etc.
+
+4. If Icon name has no tier variants:
+   → Single template, no grouping needed.
+```
+
+**Selection boxes (選択ボックス)** are a notable case: items like
+`item_icon_material_selection_0` through `_3` are color-coded boxes that
+follow the standard grouping rule (same shape, different rarity colors).
+
+### OCR Digit Templates
+
+Digit templates for quantity recognition are sourced from
+`../bluearchive-aoi/output/num/` and stored in `assets/templates/digits/`:
+
+| File    | Size    | Content              |
+|---------|---------|----------------------|
+| 0-9.png | 15x21px | Green digit glyphs   |
+| x.png   | 15x21px | Green "×" multiplier |
+
+All templates are RGBA (4 channels) with alpha masks defining the glyph boundary.
+These are embedded in the DLL alongside icon templates via `@embedFile`.
+
 ### Known Issues to Address
 
-1. **Resize quality** -- Triangle filter causes inconsistent results
-   at different source resolutions. Need better interpolation.
-
-2. **OCR accuracy** -- Digit recognition via template matching struggles
+1. **OCR accuracy** -- Digit recognition via template matching struggles
    with anti-aliased text and varying font rendering. Consider:
    - Sub-pixel alignment
    - Multiple scale matching
    - Binarization preprocessing
 
-3. **Shape-group definition** -- Need to pre-classify which templates share
-   the same shape and differ only by color. This grouping is embedded at
-   compile time alongside the templates themselves.
+2. ~~**Template embedding strategy**~~ Resolved: pre-process to raw binary
+   at build time (see Template Build Pipeline). Comptime PNG decode rejected
+   due to compile time concerns with ~1000 icons and the 30fps runtime target.
 
 ---
 
 ## Design Decision: Template Embedding
 
-**Decision: A -- All templates embedded in DLL at compile time**
+**Decision: Pre-processed raw binary, embedded at compile time**
 
-Templates (SchaleDB icon images) are compiled into the DLL binary using
-Zig's `@embedFile`. No external template registration API is needed.
+Templates (SchaleDB icon images) are pre-processed by a Node.js build script
+into raw binary format, then embedded in the DLL via Zig's `@embedFile`.
+No external template registration API is needed.
 
 ### Rationale
 
-1. **Test reproducibility** -- With templates baked into the binary, test results
+1. **30fps runtime target** -- At ~33ms per frame, zero runtime decode overhead
+   is essential. Pre-processed raw bytes are ready to use as-is.
+
+2. **Test reproducibility** -- With templates baked into the binary, test results
    are 100% deterministic. No possibility of template version mismatch between
    test runs. This is critical for achieving and proving 99%+ accuracy targets.
 
-2. **Acceptable update cadence** -- Blue Archive adds new items roughly once
+3. **Acceptable update cadence** -- Blue Archive adds new items roughly once
    every 6-12 months. A DLL rebuild at that frequency is negligible.
 
-3. **Zero startup cost** -- No file I/O, no registration loop. Templates are
+4. **Zero startup cost** -- No file I/O, no registration loop. Templates are
    available immediately as static memory.
 
-4. **Simpler API** -- No `register_template` calls needed from Rust side.
+5. **Simpler API** -- No `register_template` calls needed from Rust side.
    The DLL is self-contained.
-
-5. **`comptime` preprocessing** -- Zig can perform grayscale conversion and
-   resize at compile time, so templates are stored in their final matchable
-   form. Zero runtime preprocessing.
 
 ### Template Build Pipeline
 
 ```
-assets/icons/{items,equipment}/*.webp
-  |  (build step or @embedFile + comptime decode)
-  v
-Embedded as preprocessed 80x80 grayscale + alpha mask arrays
+assets/icons/{items,equipment}/*.png       (fetched by scripts/fetch_icons.mjs)
+assets/templates/digits/{0-9,x}.png        (copied from bluearchive-aoi)
+assets/data/items.json, equipment.json     (raw SchaleDB master data)
   |
+  |  (scripts/preprocess_templates.mjs)
+  |  - Decode PNG → raw RGBA pixels
+  |  - Resize to 80x80 (area averaging)
+  |  - Convert to grayscale + alpha mask
+  |  - Generate shape-group metadata from master data
+  v
+assets/build/templates.bin                 (packed: gray + mask per template)
+assets/build/catalog.yml                   (item catalog: id, icon, sort_order,
+  |                                         shape_group, category, rarity)
+  |  (@embedFile in Zig source)
   v
 Available at runtime as static []const u8 slices
 ```
+
+### Master Data Pipeline
+
+SchaleDB JSON files (`items.json`, `equipment.json`) contain many fields
+irrelevant to template matching. The build script extracts only what is
+needed and produces a clean `catalog.yml` sorted by internal ID.
+
+**Fields retained per item:**
+
+| Field | Source | Purpose |
+|-------|--------|---------|
+| `id` | `Id` | Internal sort order, overlap detection |
+| `icon` | `Icon` | Template file lookup |
+| `category` | `Category` | Shape-group rule (Favor special case) |
+| `sub_category` | `SubCategory` | Shape-group rule (Artifact exclusion) |
+| `rarity` | `Rarity` | Color disambiguation (N/R/SR/SSR) |
+| `shape_group` | computed | Base icon name (without `_0`..`_3` suffix) |
+| `name` | `Name` | CLI output display only |
+
+**Fields discarded:** `IsReleased`, `Quality`, `Tags`, `CraftQuality`,
+`Craftable`, `StageDrop`, `Shop`, `Desc`, `ExpValue`, `EventId`, `EventBonus`,
+`Shops`, `StatType`, `StatValue`, `LevelUpFeedExp`, and all server-specific
+variants (`*Cn`, `*Global`).
+
+The catalog is sorted by `id` (ascending), matching the in-game inventory
+sort order. This enables the sort-order optimization at runtime.
 
 ### Template Filtering
 
@@ -479,20 +631,168 @@ typedef struct {
 ShittimItem shittim_session_get_item(ShittimSession session, uint32_t index);
 
 // End session and release resources.
-// Call shittim_session_to_json() before this if you need the result.
 void shittim_session_end(ShittimSession session);
-
-// ============================================================
-// Serialization
-// ============================================================
-const char* shittim_session_to_json(ShittimSession session);
-void        shittim_free_string(const char* str);
 ```
+
+---
+
+## Test Strategy (TDD)
+
+Development follows Test-Driven Development: Red → Green → Refactor.
+Tests are organized in layers, from pure computation to full integration.
+
+### Test Layers
+
+| Layer | Target | Input | Assertion |
+|-------|--------|-------|-----------|
+| **L1: Pure math** | Area averaging, NCC, HSV conversion | Synthetic pixel arrays | Exact numeric comparison |
+| **L2: Image steps** | Resize, grid detect, cell split | `test_fixtures/screen.png` | Dimensional checks, PSNR similarity |
+| **L3: Matching** | Template NCC + color disambiguation | `test_fixtures/cells/*.png` | Correct item_id, score > baseline |
+| **L4: OCR** | Digit recognition | `test_fixtures/cells_number/*.png` | Exact quantity match vs ground truth |
+| **L5: Integration** | Full pipeline + session | `test_fixtures/screen.png` | Complete item list with quantities |
+
+### Test Fixtures
+
+Source: `../bluearchive-aoi/output/` → copied to `test_fixtures/` in this repo.
+
+| Fixture | Description | Size |
+|---------|-------------|------|
+| `screen.png` | Full game capture (2239x1246, RGB) | 1.3 MB |
+| `cells/cell_r{N}_c{N}.png` | 25 extracted grid cells (116x117, RGB) | ~5 KB each |
+| `cells_number/number_r{N}_c{N}.png` | 20 quantity regions (49x24, RGB) | ~1 KB each |
+| `cells_footer/footer_r{N}_c{N}.png` | 20 cell footer regions (RGB) | ~1 KB each |
+
+### Ground Truth
+
+`test_fixtures/ground_truth.json` defines the expected results for test screenshots.
+Each entry maps a cell position to its correct item_id and quantity.
+This file is created once by manual inspection and maintained alongside fixtures.
+
+```json
+{
+  "screen.png": {
+    "grid_size": [5, 4],  // [columns, rows]
+    "items": [
+      { "row": 0, "col": 0, "item_id": "...", "quantity": 92 },
+      { "row": 0, "col": 1, "item_id": "...", "quantity": 381 }
+    ]
+  }
+}
+```
+
+Quantities are sourced from `../bluearchive-aoi/output/items.yml`.
+Item IDs must be confirmed by manual visual inspection using the
+Zig CLI capture tool (`zig build run -- capture`).
+
+### TDD Implementation Order
+
+```
+Phase 0:
+  1. area_average_resize  ← L1: synthetic 2x2→1x1, 4x4→2x2
+  2. image_normalize      ← L2: screen.png → 1600x900
+  3. screen_classifier    ← L2: returns ITEM_INVENTORY for screen.png
+
+Phase 1:
+  4. grid_detect          ← L2: separator detection → 20 cells (5×4)
+  5. ncc_grayscale        ← L1: synthetic correlation tests
+  6. template_match       ← L3: cell → ranked candidates
+  7. color_analysis       ← L1: known HSV values → rarity classification
+  8. digit_ocr            ← L4: number region → exact quantity
+  9. cell_pipeline        ← L3: cell → (item_id, quantity)
+  10. session             ← L5: full screen → 20 items
+```
+
+---
+
+## Developer Tools
+
+### `shittim capture` -- Game Window Screenshot Capture (Zig CLI)
+
+A subcommand of the Zig CLI (`zig build run -- capture`) for capturing
+the Blue Archive game window's client area as a clean screenshot.
+
+**Purpose**: Generate test fixture images for ground truth labeling.
+The captured image must match what bluearchive-aoi's Windows Graphics Capture API
+would produce -- the client area pixels only, without OS window decorations.
+
+#### Usage
+
+```bash
+zig build run -- capture [options]
+
+Options:
+  --window-title <string>   Window title to capture (default: "BlueArchive")
+  --output <path>           Output PNG path (default: "test_fixtures/screen.png")
+  --display-scale <float>   Display scaling factor (default: auto-detect)
+  --list-windows            List all visible windows and exit
+```
+
+#### Implementation Notes
+
+**Client area capture via Win32 API:**
+Uses `GetClientRect` + `ClientToScreen` + `BitBlt` to capture only the
+client area, excluding title bar and window chrome.
+
+- `GetDpiForWindow` for automatic DPI detection
+- `--display-scale` as manual fallback
+- Output: RGB PNG (alpha removed)
+
+**Platform**: Windows 11 only. Implemented using Zig's `@cImport` of
+`windows.h` for direct Win32 API access (no PowerShell or Node.js).
+
+### `shittim scan` -- Single-shot Scan (Zig CLI)
+
+A subcommand for analyzing a screenshot and printing results to stdout
+in YAML format. Intended for standalone CLI usage and debugging.
+
+#### Usage
+
+```bash
+zig build run -- scan [options]
+
+Options:
+  --input <path>    Input PNG image (default: stdin as raw pixels)
+  --format <fmt>    Output format: yaml (default), json
+```
+
+#### Example Output
+
+```yaml
+screen_type: item_inventory
+grid_size: [5, 4]  # [columns, rows]
+items:
+  - icon: item_icon_expitem_0
+    name: 初級強化珠
+    quantity: 92
+    match_score: 0.95
+  - icon: item_icon_expitem_1
+    name: 中級強化珠
+    quantity: 381
+    match_score: 0.93
+  - icon: item_icon_skillbook_selection_0   # merge group: 3 cells summed
+    name: 初級技術ノート選択ボックス
+    quantity: 29                             # 8 + 12 + 9
+    match_score: 0.94
+    merged_cells: 3
+```
+
+Merge group items are automatically aggregated: quantities are summed
+and `merged_cells` indicates how many cells were combined.
+
+YAML is the default output format for human readability.
+The C ABI (DLL) does not include serialization -- Rust callers
+receive results via `ShittimItem` structs directly.
+
+---
 
 ## Next Steps
 
-1. Review this spec and refine API surface
-2. Create `build.zig` project scaffold
-3. Implement Phase 0 foundation (resize + screen classifier)
-4. Implement Phase 1 item inventory pipeline
-5. Integration test with bluearchive-aoi screenshots from `output/`
+1. ~~Review this spec and refine API surface~~ ✓
+2. ~~Copy OCR digit templates to `assets/templates/digits/`~~ ✓
+3. ~~Install Zig toolchain~~ ✓ (Zig 0.15.2 via winget)
+4. ~~Create `build.zig` project scaffold~~ ✓ (lib module + CLI exe + tests)
+5. Build `shittim capture` subcommand (Zig CLI, Win32 API)
+6. Capture screenshots and finalize `test_fixtures/ground_truth.json` (item_id manual labeling)
+7. Implement Phase 0 foundation (resize + screen classifier) via TDD
+8. Implement Phase 1 item inventory pipeline via TDD
+9. Integration test with ground truth data

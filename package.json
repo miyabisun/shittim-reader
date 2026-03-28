@@ -2,9 +2,9 @@
   "name": "shittim-reader",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "setup-fixtures": "node scripts/setup_test_fixtures.mjs",
+    "fetch-icons": "node scripts/fetch_icons.mjs"
   },
   "repository": {
     "type": "git",

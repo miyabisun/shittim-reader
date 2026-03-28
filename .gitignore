@@ -2,5 +2,16 @@
 assets/icons/
 assets/data/
 
+# Test fixtures (images copied via scripts/setup_test_fixtures.mjs)
+test_fixtures/*.png
+test_fixtures/cells/
+test_fixtures/cells_number/
+test_fixtures/cells_footer/
+# ground_truth.json is tracked (not ignored)
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
 # Node.js
 node_modules/

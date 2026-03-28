@@ -38,7 +38,7 @@ By extracting the image analysis pipeline into a Zig library, we gain:
 |  - User interaction        |                        |    detection       |
 |  - Master data (SchaleDB)  |   Analysis results     |  - Grid detection  |
 |                            | <----------------------|  - Template match  |
-|                            |        (JSON/struct)   |  - Quantity OCR    |
+|                            |     (C struct via FFI) |  - Quantity OCR    |
 +---------------------------+                        +-------------------+
 ```
 
@@ -53,9 +53,20 @@ By extracting the image analysis pipeline into a Zig library, we gain:
 **shittim-reader provides:**
 - Image analysis pipeline (the core value)
 - Icon templates embedded in DLL at build time
-  (fetched from SchaleDB via `scripts/fetch_icons.mjs`, preprocessed during Zig build)
+  (fetched from SchaleDB via `scripts/fetch_icons.mjs`,
+  preprocessed via `scripts/preprocess_templates.mjs`, embedded via `@embedFile`)
 - Exported as a Windows DLL with C ABI
 
-## Open Questions
+## Design Decisions (Summary)
 
-See [scope.md](./scope.md) for detailed scope discussion.
+| ID | Decision | Choice |
+|----|----------|--------|
+| D1 | Canonical resolution | 1600x900 (16:9) |
+| D2 | Resize algorithm | Area averaging (all downscale ops) |
+| D3 | Screen classifier | Key-region sampling |
+| D4 | Template embedding | All templates embedded via `@embedFile` |
+| D5 | Shape-group rules | `SubCategory`-based: Artifact excluded, tier variants grouped |
+| D6 | Development method | TDD (Red → Green → Refactor) |
+
+See [scope.md](./scope.md) for detailed scope, shape-group rules, test strategy,
+and developer tools.
