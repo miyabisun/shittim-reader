@@ -5,7 +5,16 @@
 
 const std = @import("std");
 
-test "library loads" {
-    // Placeholder: confirms the build and test pipeline works.
-    try std.testing.expect(true);
+// ── Core modules ──
+pub const area_average = @import("area_average.zig");
+pub const ncc = @import("ncc.zig");
+pub const color = @import("color.zig");
+pub const grid = @import("grid.zig");
+pub const image = @import("image.zig");
+pub const screen = @import("screen.zig");
+pub const ocr = @import("ocr.zig");
+
+test {
+    // Pull in all module tests
+    std.testing.refAllDecls(@This());
 }

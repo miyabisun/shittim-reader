@@ -4,7 +4,9 @@
   "description": "",
   "scripts": {
     "setup-fixtures": "node scripts/setup_test_fixtures.mjs",
-    "fetch-icons": "node scripts/fetch_icons.mjs"
+    "fetch-icons": "node scripts/fetch_icons.mjs",
+    "preprocess-digits": "node scripts/preprocess_digits.mjs",
+    "preprocess-templates": "node scripts/preprocess_templates.mjs"
   },
   "repository": {
     "type": "git",

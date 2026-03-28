@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Note: digit templates are at src/digits/*.raw for @embedFile access.
+    // Icon templates will use assets/build/ via addEmbedPath when ready.
+
     // ── CLI executable (developer tool) ──
     const exe = b.addExecutable(.{
         .name = "shittim",
