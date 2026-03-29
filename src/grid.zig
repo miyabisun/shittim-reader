@@ -22,15 +22,18 @@ const min_run_len: u32 = 2;
 const separator_line_ratio: u32 = 7; // numerator for N/10 threshold
 
 /// Minimum thickness (px) for a horizontal separator band to be kept.
-const min_sep_band_thickness: u32 = 10;
+/// At 1600px normalized width, 4:3 aspect produces ~6px bands, 16:9 ~15px.
+const min_sep_band_thickness: u32 = 5;
 
 /// Minimum cell width (px) in edge scan to filter noise gaps.
 const min_cell_gap: u32 = 50;
 
+/// Pixels to trim from top and bottom of each row gap before cell extraction.
+const cell_trim_px: u32 = 2;
+
 /// Max supported columns/bands for stack buffers.
 const max_cols_per_row: u32 = 10;
 const max_bands: u32 = 20;
-const max_runs_per_scan: u32 = 64;
 
 pub const Cell = struct {
     x: u32,
@@ -49,6 +52,55 @@ pub const GridResult = struct {
         allocator.free(self.cells);
     }
 };
+
+/// Return the number of usable rows, excluding a truncated last row
+/// (height < 90% of the first row).
+pub fn activeRows(result: GridResult) u32 {
+    if (result.rows < 2) return result.rows;
+    const first_h = result.cells[0].h;
+    const last_h = result.cells[(result.rows - 1) * result.cols].h;
+    return if (last_h < first_h * 9 / 10) result.rows - 1 else result.rows;
+}
+
+pub const FooterRegion = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+};
+
+/// Compute the footer (quantity label) region within a cell.
+/// Returns null if the region is degenerate (zero width/height).
+pub fn footerRegion(cell: Cell) ?FooterRegion {
+    const footer_y = cell.y + @as(u32, @intFromFloat(
+        @as(f32, @floatFromInt(cell.h)) * qty_region_start,
+    ));
+    const footer_h = cell.y + cell.h -| qty_trim_bottom -| footer_y;
+    const footer_w = cell.w -| qty_trim_right;
+    if (footer_w == 0 or footer_h == 0) return null;
+    return .{ .x = cell.x, .y = footer_y, .w = footer_w, .h = footer_h };
+}
+
+/// Copy a rectangular region from an image into a contiguous buffer.
+/// Returns the filled slice, or null if the region exceeds buf capacity.
+pub fn extractRegion(
+    pixels: []const u8,
+    img_w: u32,
+    region: FooterRegion,
+    buf: []u8,
+) ?[]u8 {
+    const row_bytes = @as(usize, region.w) * 3;
+    const total = row_bytes * region.h;
+    if (total > buf.len) return null;
+
+    for (0..region.h) |dy| {
+        const src_y = region.y + @as(u32, @intCast(dy));
+        const src_off = (@as(usize, src_y) * img_w + region.x) * 3;
+        const dst_off = dy * row_bytes;
+        @memcpy(buf[dst_off..][0..row_bytes], pixels[src_off..][0..row_bytes]);
+    }
+    return buf[0..total];
+}
 
 pub fn absDiff(a: u8, b: u8) u8 {
     return if (a > b) a - b else b - a;
@@ -116,13 +168,14 @@ pub fn findGridRegion(pixels: []const u8, width: u32, height: u32) ?RoiBounds {
     const x1 = h_last_end;
     if (x1 <= x0) return null;
 
-    // Step 2: vertical scanline at x0 + 9 (center of the left border strip).
-    // Find all runs, then use the longest one as the grid extent.
-    const cx = x0 + 9;
-
+    // Step 2: vertical scanlines at x0+9 and ±15px offsets.
+    // Scan 3 lines to avoid single-line artifacts (gray icons, UI overlays).
+    // Keep the longest run across all 3 scans.
     var best_start: u32 = 0;
     var best_len: u32 = 0;
-    {
+
+    for ([_]u32{ x0 + 9, x0 +| 9 +| 15, x0 + 9 -| 15 }) |cx| {
+        if (cx >= width) continue;
         var run_start: ?u32 = null;
         for (0..height) |yi| {
             const y: u32 = @intCast(yi);
@@ -185,22 +238,23 @@ fn findBands(is_sep: []const bool, buf: []SepBand) []SepBand {
     return buf[0..count];
 }
 
-pub const Run = struct { start: u32, end: u32 };
+pub const CellSpan = struct { left: u32, right: u32 };
 
-/// Scan a horizontal line at absolute y for #C4CFD4 runs.
-pub fn scanHLine(pixels: []const u8, img_w: u32, y: u32, x0: u32, x1: u32, buf: []Run) []Run {
+/// Scan a horizontal line for contiguous non-separator regions (cell content).
+/// Returns spans of non-#C4CFD4 pixels with width >= min_cell_gap.
+pub fn scanCellSpans(pixels: []const u8, img_w: u32, y: u32, x0: u32, x1: u32, buf: []CellSpan) []CellSpan {
     var count: usize = 0;
     var run_start: ?u32 = null;
 
     for (x0..x1) |xi| {
         const x: u32 = @intCast(xi);
         const idx = (@as(usize, y) * img_w + x) * 3;
-        if (isSeparatorColor(pixels, idx)) {
+        if (!isSeparatorColor(pixels, idx)) {
             if (run_start == null) run_start = x;
         } else {
             if (run_start) |rs| {
-                if (x - rs >= min_run_len and count < buf.len) {
-                    buf[count] = .{ .start = rs, .end = x - 1 };
+                if (x - rs >= min_cell_gap and count < buf.len) {
+                    buf[count] = .{ .left = rs, .right = x - 1 };
                     count += 1;
                 }
                 run_start = null;
@@ -208,26 +262,8 @@ pub fn scanHLine(pixels: []const u8, img_w: u32, y: u32, x0: u32, x1: u32, buf: 
         }
     }
     if (run_start) |rs| {
-        if (x1 - rs >= min_run_len and count < buf.len) {
-            buf[count] = .{ .start = rs, .end = x1 - 1 };
-            count += 1;
-        }
-    }
-    return buf[0..count];
-}
-
-pub const CellSpan = struct { left: u32, right: u32 };
-
-/// Extract cell spans (gaps between separator runs) with width >= min_cell_gap.
-pub fn cellSpansFromRuns(runs: []const Run, buf: []CellSpan) []CellSpan {
-    var count: usize = 0;
-    if (runs.len < 2) return buf[0..0];
-
-    for (0..runs.len - 1) |i| {
-        const left = runs[i].end + 1;
-        const right = runs[i + 1].start -| 1;
-        if (right > left and right - left >= min_cell_gap and count < buf.len) {
-            buf[count] = .{ .left = left, .right = right };
+        if (x1 - rs >= min_cell_gap and count < buf.len) {
+            buf[count] = .{ .left = rs, .right = x1 - 1 };
             count += 1;
         }
     }
@@ -236,13 +272,14 @@ pub fn cellSpansFromRuns(runs: []const Run, buf: []CellSpan) []CellSpan {
 
 /// Detect grid cells in an RGB image of any resolution/aspect ratio.
 ///
-/// Parallelogram-aware algorithm:
+/// Square-cell algorithm:
 /// 1. Find grid ROI via scanline sampling (findGridRegion)
 /// 2. Within ROI, detect horizontal separator bands (contiguous rows with ≥70% #C4CFD4)
-/// 3. Cell rows = gaps between adjacent separator bands
-/// 4. For each cell row, scan the top edge and bottom edge horizontally
-///    to find per-row cell column boundaries (handles parallelogram skew)
-/// 5. Cell bounding rect = top-left x to bottom-right x
+/// 3. Filter short row gaps (headers) and determine row boundaries
+/// 4. Row 0: trim 2px top/bottom, ensure even height, scan center line
+///    for column positions → square cells (side = trimmed height)
+/// 5. Rows 1+: reuse row 0's cell size and column x-positions,
+///    center vertically within each row gap
 pub fn detectGrid(
     allocator: std.mem.Allocator,
     pixels: []const u8,
@@ -262,7 +299,6 @@ pub fn detectGrid(
     if (roi_w < min_cell_gap or roi_h < min_cell_gap) return empty;
 
     // ── Step 1: Horizontal separator band detection ──
-    // For each row in ROI, check if ≥70% of pixels match #C4CFD4.
     const h_is_sep = try allocator.alloc(bool, roi_h);
     defer allocator.free(h_is_sep);
 
@@ -279,7 +315,6 @@ pub fn detectGrid(
         h_is_sep[dy] = match_count > roi_w * separator_line_ratio / 10;
     }
 
-    // Find contiguous separator bands and filter by minimum thickness
     var all_bands_buf: [max_bands]SepBand = undefined;
     const all_bands = findBands(h_is_sep, &all_bands_buf);
 
@@ -295,70 +330,98 @@ pub fn detectGrid(
 
     if (h_bands.len < 2) return empty;
 
-    const n_rows: u32 = @intCast(h_bands.len - 1);
-
-    // ── Step 2: Per-row parallelogram cell detection ──
-    // Scan each row's top/bottom edges. First row determines column count.
-    var n_cols: u32 = 0;
-    var cells: ?[]Cell = null;
-    errdefer if (cells) |c| allocator.free(c);
-
-    // Temporary per-row scan results (max_cols_per_row × 2 cell spans per row)
-    var per_row_top: [max_bands][max_cols_per_row]CellSpan = undefined;
-    var per_row_bot: [max_bands][max_cols_per_row]CellSpan = undefined;
-    var per_row_top_len: [max_bands]u32 = undefined;
-    var per_row_bot_len: [max_bands]u32 = undefined;
-
-    for (0..n_rows) |r| {
-        const top_y = roi.y0 + h_bands[r].end + 1;
-        const bot_y = roi.y0 + h_bands[r + 1].start -| 1;
-
-        var tr_buf: [max_runs_per_scan]Run = undefined;
-        var br_buf: [max_runs_per_scan]Run = undefined;
-
-        const top_runs = scanHLine(pixels, width, top_y, roi.x0, roi.x1, &tr_buf);
-        const bot_runs = scanHLine(pixels, width, bot_y, roi.x0, roi.x1, &br_buf);
-        const top_cells = cellSpansFromRuns(top_runs, &per_row_top[r]);
-        const bot_cells = cellSpansFromRuns(bot_runs, &per_row_bot[r]);
-
-        per_row_top_len[r] = @intCast(top_cells.len);
-        per_row_bot_len[r] = @intCast(bot_cells.len);
-
-        if (r == 0) {
-            n_cols = @intCast(@min(top_cells.len, bot_cells.len));
-            if (n_cols == 0) return empty;
-            cells = try allocator.alloc(Cell, n_cols * n_rows);
+    // ── Step 2: Filter short row gaps (e.g. header region) ──
+    // 4:3 screens have a thin header row ("リスト デフォルト ...") between the
+    // top border band and the first real separator. When consecutive bands are
+    // closer than min_cell_gap, replace the previous band with the current one
+    // so the short gap is absorbed into the preceding separator region.
+    var valid_bands_buf: [max_bands]SepBand = undefined;
+    valid_bands_buf[0] = h_bands[0];
+    var n_valid: usize = 1;
+    for (1..h_bands.len) |i| {
+        const gap = h_bands[i].start -| h_bands[n_valid - 1].end;
+        if (gap >= min_cell_gap) {
+            valid_bands_buf[n_valid] = h_bands[i];
+            n_valid += 1;
+        } else {
+            valid_bands_buf[n_valid - 1] = h_bands[i];
         }
     }
+    const valid_bands = valid_bands_buf[0..n_valid];
 
-    // ── Step 3: Build cell array from scan results ──
-    const cell_slice = cells orelse return empty;
+    if (valid_bands.len < 2) return empty;
+
+    const n_rows: u32 = @intCast(valid_bands.len - 1);
+
+    // ── Step 3: Row 0 — determine cell size and column positions ──
+    // Trim 2px top/bottom. If remaining height is odd, trim 1 more from top.
+    const r0_raw_top = roi.y0 + valid_bands[0].end + 1;
+    const r0_raw_bot = roi.y0 + valid_bands[1].start -| 1;
+    var r0_top = r0_raw_top + cell_trim_px;
+    const r0_bot = r0_raw_bot -| cell_trim_px;
+    var cell_side = r0_bot - r0_top + 1;
+    if (cell_side % 2 != 0) {
+        r0_top += 1;
+        cell_side -= 1;
+    }
+    if (cell_side < min_cell_gap) return empty;
+
+    // Scan 2 horizontal lines at 5% from top and bottom of row 0.
+    // These positions hit cell background (not icon area), avoiding
+    // gray icons that coincidentally match separator color.
+    // Use the 4 x-coordinates (top-left, top-right, bot-left, bot-right)
+    // to compute each column's center.
+    const inset = cell_side * 5 / 100;
+    const scan_top_y = r0_top + inset;
+    const scan_bot_y = r0_top + cell_side - 1 - inset;
+
+    var top_spans_buf: [max_cols_per_row]CellSpan = undefined;
+    var bot_spans_buf: [max_cols_per_row]CellSpan = undefined;
+    const top_spans = scanCellSpans(pixels, width, scan_top_y, roi.x0, roi.x1, &top_spans_buf);
+    const bot_spans = scanCellSpans(pixels, width, scan_bot_y, roi.x0, roi.x1, &bot_spans_buf);
+
+    const n_cols: u32 = @intCast(@min(top_spans.len, bot_spans.len));
+    if (n_cols == 0) return empty;
+
+    // Compute column x-positions: center of 4 corner points, extend side/2 left
+    var col_x: [max_cols_per_row]u32 = undefined;
+    const half = cell_side / 2;
+    for (0..n_cols) |c| {
+        const sum = @as(u32, top_spans[c].left) + top_spans[c].right +
+            bot_spans[c].left + bot_spans[c].right;
+        const center_x = sum / 4;
+        col_x[c] = center_x -| half;
+    }
+
+    // ── Step 4: Build cell array ──
+    const cells = try allocator.alloc(Cell, n_cols * n_rows);
+    errdefer allocator.free(cells);
 
     for (0..n_rows) |r| {
-        const top_y = roi.y0 + h_bands[r].end + 1;
-        const bot_y = roi.y0 + h_bands[r + 1].start -| 1;
-        const top_cells = per_row_top[r][0..per_row_top_len[r]];
-        const bot_cells = per_row_bot[r][0..per_row_bot_len[r]];
-        const row_cols: u32 = @intCast(@min(top_cells.len, bot_cells.len));
+        const cell_y = if (r == 0) r0_top else blk: {
+            const raw_top = roi.y0 + valid_bands[r].end + 1;
+            const raw_bot = roi.y0 + valid_bands[r + 1].start -| 1;
+            const raw_h = raw_bot - raw_top + 1;
+            if (raw_h <= cell_side) {
+                break :blk raw_top;
+            }
+            const excess = raw_h - cell_side;
+            // Extra pixel trimmed from top when excess is odd
+            break :blk raw_top + (excess + 1) / 2;
+        };
 
         for (0..n_cols) |c| {
-            if (c < row_cols) {
-                const x = top_cells[c].left;
-                const x_end = bot_cells[c].right;
-                cell_slice[r * n_cols + c] = .{
-                    .x = x,
-                    .y = top_y,
-                    .w = if (x_end > x) x_end - x + 1 else 0,
-                    .h = if (bot_y > top_y) bot_y - top_y + 1 else 0,
-                };
-            } else {
-                cell_slice[r * n_cols + c] = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-            }
+            cells[r * n_cols + c] = .{
+                .x = col_x[c],
+                .y = cell_y,
+                .w = cell_side,
+                .h = cell_side,
+            };
         }
     }
 
     return GridResult{
-        .cells = cell_slice,
+        .cells = cells,
         .cols = n_cols,
         .rows = n_rows,
         .roi = roi,
@@ -460,16 +523,13 @@ test "findBands groups contiguous true values" {
     try std.testing.expectEqual(@as(u32, 3), bands[2].thickness());
 }
 
-test "detectGrid: parallelogram cells with skewed separators" {
-    // Synthetic 400x400 image with 2 rows × 2 cols of parallelogram cells.
-    // Separator bands are 15px tall. Vertical separators shift right as y
-    // increases (simulating the italic skew of the game grid).
+test "detectGrid: square cells from center-line scan" {
+    // Synthetic 400x400 image with 2 rows × 2 cols.
+    // Separator bands are 15px tall. Vertical separators span full cell height
+    // with a slight skew (simulating the italic skew of the game grid).
     //
-    // Layout (x axis):
-    //   [left border 20px] [cell col0 ~68px] [v-sep 5px] [cell col1 ~80px] [right border 5px]
-    //
-    // The v-sep x position differs between top and bottom edges of each row,
-    // creating parallelogram-shaped cells.
+    // Row gap: y=65..169 (105px). Trim 2+2=4 → 101px, odd → trim 1 more → 100px.
+    // cell_side = 100, mid_y = 68 + 50 = 118.
     const alloc = std.testing.allocator;
     const w: u32 = 400;
     const h: u32 = 400;
@@ -490,17 +550,17 @@ test "detectGrid: parallelogram cells with skewed separators" {
     testFillRect(pixels, w, gx0, 170, gx1, 185); // band 1
     testFillRect(pixels, w, gx0, 290, gx1, 305); // band 2
 
-    // Row 0 vertical separators (skewed):
-    // Top edge (y=65, first row after band 0): v-sep at x=288..292
-    testFillRect(pixels, w, 288, 65, 293, 66);
-    // Bottom edge (y=169, last row before band 1): v-sep shifted right to x=298..302
-    testFillRect(pixels, w, 298, 169, 303, 170);
-
-    // Row 1 vertical separators (skewed):
-    // Top edge (y=185): v-sep at x=290..294
-    testFillRect(pixels, w, 290, 185, 295, 186);
-    // Bottom edge (y=289): v-sep shifted right to x=300..304
-    testFillRect(pixels, w, 300, 289, 305, 290);
+    // Vertical separators (skewed, full cell height) for both rows.
+    for (65..170) |yi| {
+        const t = @as(f32, @floatFromInt(yi - 65)) / 105.0;
+        const cx: u32 = 288 + @as(u32, @intFromFloat(@round(t * 10.0)));
+        testFillRect(pixels, w, cx, @intCast(yi), cx + 5, @intCast(yi + 1));
+    }
+    for (185..290) |yi| {
+        const t = @as(f32, @floatFromInt(yi - 185)) / 105.0;
+        const cx: u32 = 290 + @as(u32, @intFromFloat(@round(t * 10.0)));
+        testFillRect(pixels, w, cx, @intCast(yi), cx + 5, @intCast(yi + 1));
+    }
 
     const result = try detectGrid(alloc, pixels, w, h);
     defer result.deinit(alloc);
@@ -508,38 +568,201 @@ test "detectGrid: parallelogram cells with skewed separators" {
     try std.testing.expectEqual(@as(u32, 2), result.cols);
     try std.testing.expectEqual(@as(u32, 2), result.rows);
 
-    const c00 = result.cells[0]; // Row 0, Col 0
-    const c01 = result.cells[1]; // Row 0, Col 1
-    const c10 = result.cells[2]; // Row 1, Col 0
-    const c11 = result.cells[3]; // Row 1, Col 1
-
-    // ── Structural invariants ──
-    // All cells must have non-zero dimensions
+    // All cells are square with side = 100 (105 - 4 trim - 1 odd adjust)
     for (result.cells) |cell| {
-        try std.testing.expect(cell.w > 0);
-        try std.testing.expect(cell.h > 0);
+        try std.testing.expectEqual(@as(u32, 100), cell.w);
+        try std.testing.expectEqual(@as(u32, 100), cell.h);
     }
 
-    // Col 0 x must be after left border end (x=220)
-    try std.testing.expectEqual(@as(u32, 220), c00.x);
-    try std.testing.expectEqual(@as(u32, 220), c10.x);
+    // Row 0 and row 1 have same x-coordinates (column positions fixed by row 0)
+    try std.testing.expectEqual(result.cells[0].x, result.cells[2].x);
+    try std.testing.expectEqual(result.cells[1].x, result.cells[3].x);
+}
 
-    // Col 1 x comes from top-edge v-sep end+1:
-    //   Row 0 top v-sep painted at x=[288..292] → cell starts at 293
-    //   Row 1 top v-sep painted at x=[290..294] → cell starts at 295
-    try std.testing.expectEqual(@as(u32, 293), c01.x);
-    try std.testing.expectEqual(@as(u32, 295), c11.x);
+// ── activeRows tests ──
 
-    // Heights: row 0 = y65..y169 = 105px, row 1 = y185..y289 = 105px
-    try std.testing.expectEqual(@as(u32, 105), c00.h);
-    try std.testing.expectEqual(@as(u32, 105), c10.h);
+test "activeRows: 0 rows → 0" {
+    const alloc = std.testing.allocator;
+    const cells = try alloc.alloc(Cell, 0);
+    defer alloc.free(cells);
+    const r = GridResult{ .cells = cells, .cols = 0, .rows = 0, .roi = null };
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), activeRows(r));
+}
 
-    // Parallelogram property: col 0 width uses top-left x (220) to
-    // bottom-right x (297 from bot v-sep start-1), so w = 297-220+1 = 78
-    try std.testing.expectEqual(@as(u32, 78), c00.w);
+test "activeRows: 1 row → 1 (no comparison possible)" {
+    const alloc = std.testing.allocator;
+    const cells = try alloc.alloc(Cell, 1);
+    defer alloc.free(cells);
+    cells[0] = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const r = GridResult{ .cells = cells, .cols = 1, .rows = 1, .roi = null };
+    try std.testing.expectEqual(@as(u32, 1), activeRows(r));
+}
 
-    // Col 1 right edge from bottom-edge right border start-1:
-    //   Row 0 bot: right border=[385..389], cell right = 384
-    //   w = 384 - 293 + 1 = 92
-    try std.testing.expectEqual(@as(u32, 92), c01.w);
+test "activeRows: all rows equal height → all kept" {
+    const alloc = std.testing.allocator;
+    const cells = try alloc.alloc(Cell, 6);
+    defer alloc.free(cells);
+    for (cells) |*c| c.* = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const r = GridResult{ .cells = cells, .cols = 3, .rows = 2, .roi = null };
+    try std.testing.expectEqual(@as(u32, 2), activeRows(r));
+}
+
+test "activeRows: last row truncated → excluded" {
+    const alloc = std.testing.allocator;
+    const cells = try alloc.alloc(Cell, 6);
+    defer alloc.free(cells);
+    // Row 0: h=100
+    for (cells[0..3]) |*c| c.* = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    // Row 1: h=50 (50% of first row, well below 90%)
+    for (cells[3..6]) |*c| c.* = .{ .x = 0, .y = 100, .w = 100, .h = 50 };
+    const r = GridResult{ .cells = cells, .cols = 3, .rows = 2, .roi = null };
+    try std.testing.expectEqual(@as(u32, 1), activeRows(r));
+}
+
+test "activeRows: boundary — 89/100 excluded, 90/100 kept" {
+    const alloc = std.testing.allocator;
+    // first_h=100 → threshold = 100*9/10 = 90 (integer division)
+    // last_h=89 < 90 → excluded
+    const cells89 = try alloc.alloc(Cell, 2);
+    defer alloc.free(cells89);
+    cells89[0] = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    cells89[1] = .{ .x = 0, .y = 100, .w = 100, .h = 89 };
+    const r89 = GridResult{ .cells = cells89, .cols = 1, .rows = 2, .roi = null };
+    try std.testing.expectEqual(@as(u32, 1), activeRows(r89));
+
+    // last_h=90 >= 90 → kept
+    const cells90 = try alloc.alloc(Cell, 2);
+    defer alloc.free(cells90);
+    cells90[0] = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    cells90[1] = .{ .x = 0, .y = 100, .w = 100, .h = 90 };
+    const r90 = GridResult{ .cells = cells90, .cols = 1, .rows = 2, .roi = null };
+    try std.testing.expectEqual(@as(u32, 2), activeRows(r90));
+}
+
+test "activeRows: odd first_h boundary — 99*9/10=89" {
+    const alloc = std.testing.allocator;
+    // first_h=99 → threshold = 99*9/10 = 89 (integer truncation: 891/10=89)
+    const cells = try alloc.alloc(Cell, 2);
+    defer alloc.free(cells);
+    cells[0] = .{ .x = 0, .y = 0, .w = 100, .h = 99 };
+    cells[1] = .{ .x = 0, .y = 100, .w = 100, .h = 89 };
+    const r = GridResult{ .cells = cells, .cols = 1, .rows = 2, .roi = null };
+    try std.testing.expectEqual(@as(u32, 2), activeRows(r));
+
+    // last_h=88 < 89 → excluded
+    cells[1].h = 88;
+    try std.testing.expectEqual(@as(u32, 1), activeRows(r));
+}
+
+// ── footerRegion tests ──
+
+test "footerRegion: typical 116x116 cell" {
+    const cell = Cell{ .x = 900, .y = 200, .w = 116, .h = 116 };
+    const footer = footerRegion(cell).?;
+    // qty_region_start=0.75 → footer_y = 200 + floor(116*0.75) = 200+87 = 287
+    try std.testing.expectEqual(@as(u32, 287), footer.y);
+    // footer_h = (200+116) - 6 - 287 = 316 - 6 - 287 = 23
+    try std.testing.expectEqual(@as(u32, 23), footer.h);
+    // footer_w = 116 - 8 = 108
+    try std.testing.expectEqual(@as(u32, 108), footer.w);
+    // x unchanged
+    try std.testing.expectEqual(@as(u32, 900), footer.x);
+}
+
+test "footerRegion: cell too small for footer → null" {
+    // h=8: footer_y = 0 + floor(8*0.75) = 6, footer_h = (0+8) - 6 - 6 = -4 → saturate to 0
+    const cell = Cell{ .x = 0, .y = 0, .w = 20, .h = 8 };
+    try std.testing.expect(footerRegion(cell) == null);
+}
+
+test "footerRegion: w <= qty_trim_right → null" {
+    // w=8: footer_w = 8 -| 8 = 0 → null
+    const cell = Cell{ .x = 0, .y = 0, .w = 8, .h = 116 };
+    try std.testing.expect(footerRegion(cell) == null);
+}
+
+// ── extractRegion tests ──
+
+test "extractRegion: copies correct pixels" {
+    // 4x4 RGB image with each pixel = (row, col, 0)
+    const img_w: u32 = 4;
+    var pixels: [4 * 4 * 3]u8 = undefined;
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const i = (y * 4 + x) * 3;
+            pixels[i] = @intCast(y);
+            pixels[i + 1] = @intCast(x);
+            pixels[i + 2] = 0;
+        }
+    }
+
+    // Extract 2x2 region at (1,1)
+    const region = FooterRegion{ .x = 1, .y = 1, .w = 2, .h = 2 };
+    var buf: [2 * 2 * 3]u8 = undefined;
+    const result = extractRegion(&pixels, img_w, region, &buf).?;
+
+    try std.testing.expectEqual(@as(usize, 12), result.len);
+    // Row 0 of region = image row 1, cols 1..2
+    try std.testing.expectEqual(@as(u8, 1), result[0]); // y=1
+    try std.testing.expectEqual(@as(u8, 1), result[1]); // x=1
+    try std.testing.expectEqual(@as(u8, 1), result[3]); // y=1
+    try std.testing.expectEqual(@as(u8, 2), result[4]); // x=2
+    // Row 1 of region = image row 2, cols 1..2
+    try std.testing.expectEqual(@as(u8, 2), result[6]); // y=2
+    try std.testing.expectEqual(@as(u8, 1), result[7]); // x=1
+}
+
+test "extractRegion: buffer too small → null" {
+    var pixels: [100 * 3]u8 = undefined;
+    const region = FooterRegion{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    var small_buf: [10]u8 = undefined;
+    try std.testing.expect(extractRegion(&pixels, 10, region, &small_buf) == null);
+}
+
+// ── scanCellSpans tests ──
+
+test "scanCellSpans: all separator → 0 spans" {
+    const w: u32 = 100;
+    var pixels: [100 * 3]u8 = undefined;
+    // Fill with separator color (#C4CFD4)
+    for (0..100) |i| {
+        pixels[i * 3] = 196;
+        pixels[i * 3 + 1] = 207;
+        pixels[i * 3 + 2] = 212;
+    }
+    var buf: [10]CellSpan = undefined;
+    const spans = scanCellSpans(&pixels, w, 0, 0, 100, &buf);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+}
+
+test "scanCellSpans: all non-separator → 1 span" {
+    const w: u32 = 100;
+    var pixels: [100 * 3]u8 = undefined;
+    @memset(&pixels, 0); // black = not separator
+    var buf: [10]CellSpan = undefined;
+    const spans = scanCellSpans(&pixels, w, 0, 0, 100, &buf);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expectEqual(@as(u32, 0), spans[0].left);
+    try std.testing.expectEqual(@as(u32, 99), spans[0].right);
+}
+
+test "scanCellSpans: narrow gap below min_cell_gap → filtered" {
+    const w: u32 = 100;
+    var pixels: [100 * 3]u8 = undefined;
+    // Fill separator
+    for (0..100) |i| {
+        pixels[i * 3] = 196;
+        pixels[i * 3 + 1] = 207;
+        pixels[i * 3 + 2] = 212;
+    }
+    // Small non-separator gap at x=40..49 (10px < min_cell_gap=50)
+    for (40..50) |i| {
+        pixels[i * 3] = 0;
+        pixels[i * 3 + 1] = 0;
+        pixels[i * 3 + 2] = 0;
+    }
+    var buf: [10]CellSpan = undefined;
+    const spans = scanCellSpans(&pixels, w, 0, 0, 100, &buf);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
 }
