@@ -9,8 +9,6 @@ const blue_weight = @import("blue_weight.zig");
 const proj = @import("projection.zig");
 const digit_mod = @import("digit.zig");
 
-// NOTE: skew_factor is also used in scripts/extract_digit_profiles.mjs
-// and scripts/skew_test.mjs — keep in sync.
 const skew_factor: f32 = 0.25;
 
 // Max deskewed image dimensions for stack buffer.
@@ -21,25 +19,74 @@ const max_deskew_src_h: u32 = 50;
 const max_deskew_dst_w: u32 = max_deskew_src_w + max_deskew_src_h;
 const max_deskew_buf_size: u32 = max_deskew_dst_w * max_deskew_src_h * 3;
 
-/// Threshold for 'x' detection: segments with peak below this at the
-/// left edge are considered the 'x' prefix character.
-const x_peak_threshold: f32 = 4.0;
-
 /// Minimum peak to keep a segment (noise filter).
 const noise_peak_threshold: f32 = 3.0;
 
-/// Maximum start column for a segment to be considered the 'x' prefix.
-const x_max_start_col: u32 = 8;
-
 /// Minimum segment width to keep (noise filter).
 const noise_min_width: u32 = 5;
+
+/// Number of top rows to check for 'x' detection.
+/// 'x' is shorter than digits: its row projection has zero weight in
+/// the top rows where digit strokes begin (row 0..top_margin-1).
+const x_top_margin: u32 = 5;
+
+/// If the total weight in the top margin rows is below this fraction
+/// of the segment's total weight, the segment is classified as 'x'.
+const x_top_ratio: f32 = 0.05;
+
+/// Check if a digit classified as 8 is actually 6.
+///
+/// Compares the rightmost stroke position in the upper vs lower third
+/// using raw blueWeight (not the refined weight map, which loses the
+/// anti-aliased edge information needed for precise stroke positioning).
+fn isActually6(pixels: []const u8, w: u32, h: u32, seg_start: u32, seg_end: u32) bool {
+    const upper_end = h / 3;
+    const lower_start = h * 2 / 3;
+
+    var upper_sum: i32 = 0;
+    var upper_count: u32 = 0;
+    for (0..upper_end) |y| {
+        var x = seg_end;
+        while (x > seg_start) {
+            x -= 1;
+            const idx = (y * w + x) * 3;
+            if (blue_weight.blueWeight(pixels[idx], pixels[idx + 1], pixels[idx + 2]) > blue_weight.strong_threshold) {
+                upper_sum += @intCast(x);
+                upper_count += 1;
+                break;
+            }
+        }
+    }
+
+    var lower_sum: i32 = 0;
+    var lower_count: u32 = 0;
+    for (lower_start..h) |y| {
+        var x = seg_end;
+        while (x > seg_start) {
+            x -= 1;
+            const idx = (y * w + x) * 3;
+            if (blue_weight.blueWeight(pixels[idx], pixels[idx + 1], pixels[idx + 2]) > blue_weight.strong_threshold) {
+                lower_sum += @intCast(x);
+                lower_count += 1;
+                break;
+            }
+        }
+    }
+
+    if (upper_count == 0 or lower_count == 0) return false;
+
+    const upper_avg = @divTrunc(upper_sum, @as(i32, @intCast(upper_count)));
+    const lower_avg = @divTrunc(lower_sum, @as(i32, @intCast(lower_count)));
+
+    return lower_avg - upper_avg >= 3;
+}
 
 /// Apply horizontal shear to correct italic (right-leaning) text.
 ///
 /// Each output pixel (ox, oy) samples from input at (ox + skew * oy, oy)
 /// using bilinear interpolation. The output is wider by ceil(skew * height).
 /// Pixels outside the input bounds are filled with black (0).
-fn deskew(
+pub fn deskew(
     buf: []u8,
     pixels: []const u8,
     w: u32,
@@ -97,9 +144,10 @@ pub fn recognizeDigits(
     w: u32,
     h: u32,
 ) ?u32 {
-    // Step 1: Compute blue gradient weight map
+    // Step 1: Compute blue gradient weight map with spatial refinement
     var wmap_buf: [blue_weight.max_weight_map_size]f32 = undefined;
     const wmap = blue_weight.computeWeightMap(&wmap_buf, pixels, w, h);
+    blue_weight.refineWeightMap(wmap, w, h);
 
     // Step 2: Column projection
     var col_buf: [proj.max_profile_w]f32 = undefined;
@@ -111,7 +159,7 @@ pub fn recognizeDigits(
 
     if (raw_segs.len == 0) return null;
 
-    // Step 4: Post-process segments — filter noise and skip 'x'
+    // Step 4: Post-process segments — filter noise and detect 'x' prefix
     var digit_segs: [proj.max_segments]proj.Segment = undefined;
     var n_digit_segs: u32 = 0;
     var skipped_x = false;
@@ -126,10 +174,26 @@ pub fn recognizeDigits(
         // Filter noise: narrow segments with low peak
         if (peak < noise_peak_threshold and seg.width() < noise_min_width) continue;
 
-        // Detect 'x' prefix: first segment at left edge with low peak
-        if (!skipped_x and seg.start < x_max_start_col and peak < x_peak_threshold) {
-            skipped_x = true;
-            continue;
+        // Detect 'x' by vertical extent: x is shorter than digits.
+        // Digits have strokes in the top rows of the footer image;
+        // x has near-zero weight there because it sits lower.
+        if (!skipped_x) {
+            var row_buf: [proj.max_profile_h]f32 = undefined;
+            const row_prof = proj.rowProjection(wmap, w, h, seg.start, seg.end, &row_buf);
+
+            var top_weight: f32 = 0;
+            var total_weight: f32 = 0;
+            for (0..h) |ry| {
+                total_weight += row_prof[ry];
+                if (ry < x_top_margin) {
+                    top_weight += row_prof[ry];
+                }
+            }
+
+            if (total_weight > 0 and top_weight / total_weight < x_top_ratio) {
+                skipped_x = true;
+                continue;
+            }
         }
 
         if (n_digit_segs < digit_segs.len) {
@@ -163,12 +227,16 @@ pub fn recognizeDigits(
         proj.normalizeProfile(char_row[0..half_h], &norm_upper);
         proj.normalizeProfile(char_row[half_h..h], &norm_lower);
 
-        const d = digit_mod.classifyDigit(.{
+        var d = digit_mod.classifyDigit(.{
             .col = norm_col,
             .row = norm_row,
             .row_upper = norm_upper,
             .row_lower = norm_lower,
         });
+
+        if (d == 8 and isActually6(pixels, w, h, seg.start, seg.end)) {
+            d = 6;
+        }
 
         value = value * 10 + d;
     }

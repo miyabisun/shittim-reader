@@ -75,6 +75,45 @@ pub fn computeWeightMap(buf: []f32, pixels: []const u8, w: u32, h: u32) []f32 {
     return buf[0..n];
 }
 
+/// Hysteresis thresholds for spatial refinement.
+pub const strong_threshold: f32 = 0.3;
+const weak_threshold: f32 = 0.05;
+
+/// Refine weight map using 4-connected spatial continuity.
+///
+/// Pixels with weight >= strong_threshold are always kept.
+/// Pixels with weight in [weak_threshold, strong_threshold) are kept
+/// only if at least one 4-neighbor has weight >= strong_threshold.
+/// Pixels below weak_threshold are zeroed.
+///
+/// This removes isolated noise from icon backgrounds that happen to
+/// fall near the blue-white gradient line, while preserving anti-aliased
+/// edges of text strokes that are adjacent to strong text pixels.
+pub fn refineWeightMap(wmap: []f32, w: u32, h: u32) void {
+    const n = w * h;
+    // Single pass: strong pixels are kept, weak pixels zeroed,
+    // medium pixels kept only if a 4-neighbor is strong.
+    // Strong values are never modified, so neighbor reads are stable.
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const v = wmap[i];
+        if (v >= strong_threshold) continue; // keep as-is
+        if (v < weak_threshold) {
+            wmap[i] = 0;
+            continue;
+        }
+        // Medium pixel: check 4-neighbors for a strong pixel
+        const x = i % w;
+        const y = i / w;
+        const has_strong =
+            (x > 0 and wmap[i - 1] >= strong_threshold) or
+            (x + 1 < w and wmap[i + 1] >= strong_threshold) or
+            (y > 0 and wmap[i - w] >= strong_threshold) or
+            (y + 1 < h and wmap[i + w] >= strong_threshold);
+        if (!has_strong) wmap[i] = 0;
+    }
+}
+
 // ── Tests ──
 
 test "core color gives maximum weight" {
@@ -117,6 +156,48 @@ test "red background gives zero weight" {
 test "green background gives zero weight" {
     const w = blueWeight(50, 200, 50);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), w, 1e-3);
+}
+
+test "refineWeightMap: medium pixel kept if adjacent to strong" {
+    // 3x3 map:
+    //   0.5  0.1  0.0
+    //   0.4  0.2  0.01
+    //   0.3  0.03 0.0
+    var wmap = [_]f32{
+        0.5, 0.1, 0.0,
+        0.4, 0.2, 0.01,
+        0.3, 0.03, 0.0,
+    };
+    refineWeightMap(&wmap, 3, 3);
+
+    // (0,0)=0.5 ≥ 0.3: strong, kept
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), wmap[0], 1e-6);
+    // (1,0)=0.1: medium, right neighbor (0,0)=0.5 is strong → kept
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), wmap[1], 1e-6);
+    // (2,0)=0.0: below weak threshold → 0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), wmap[2], 1e-6);
+    // (0,1)=0.4: strong, kept
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), wmap[3], 1e-6);
+    // (1,1)=0.2: medium, neighbors include (0,1)=0.4 strong → kept
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), wmap[4], 1e-6);
+    // (2,1)=0.01: below weak threshold → 0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), wmap[5], 1e-6);
+    // (0,2)=0.3: strong, kept
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), wmap[6], 1e-6);
+    // (1,2)=0.03: below weak threshold → 0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), wmap[7], 1e-6);
+}
+
+test "refineWeightMap: isolated medium pixel removed" {
+    // Medium pixel surrounded by weak/zero neighbors
+    var wmap = [_]f32{
+        0.0,  0.0, 0.0,
+        0.0,  0.15, 0.0,
+        0.0,  0.0, 0.0,
+    };
+    refineWeightMap(&wmap, 3, 3);
+    // Center pixel has no strong neighbor → zeroed
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), wmap[4], 1e-6);
 }
 
 test "computeWeightMap basic" {

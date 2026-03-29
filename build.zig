@@ -43,6 +43,12 @@ pub fn build(b: *std.Build) void {
         const zigimg = dep.module("zigimg");
         // split-cells: extract individual cell PNGs from a cropped grid image
         addDevTool(b, lib_mod, zigimg, "split-cells", "Split grid image into cell PNGs", "tools/split_cells.zig");
+        // ncc-probe: find optimal cell scale for template matching
+        addDevTool(b, lib_mod, zigimg, "ncc-probe", "Probe NCC matching at various cell scales", "tools/ncc_probe.zig");
+        // scan-screenshot: OCR a screenshot PNG and output YAML
+        addDevTool(b, lib_mod, zigimg, "scan-screenshot", "Scan screenshot and output item quantities as YAML", "tools/scan_screenshot.zig");
+        // x-debug: analyze weight distribution for x detection
+        addDevTool(b, lib_mod, zigimg, "x-debug", "Debug x character weight distribution", "tools/x_debug.zig");
     }
 
     // ── Tests ──
