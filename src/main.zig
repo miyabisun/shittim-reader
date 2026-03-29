@@ -6,18 +6,20 @@
 //! Usage:
 //!   zig build run -- scan                         # auto-detect game window
 //!   zig build run -- scan --title "BlueArchive"   # specify window title
+//!   zig build run -- scan --wgc                   # use WGC background capture
 //!   zig build run -- scan --list-windows          # list visible windows
 
 const std = @import("std");
 const shittim = @import("shittim_reader");
 const capture = @import("capture.zig");
+const wgc = @import("wgc.zig");
 
 const grid = shittim.grid;
 const image = shittim.image;
 const ocr = shittim.ocr;
 const screen_mod = shittim.screen;
 
-/// Maximum footer region size for stack buffer (pixels × 3 channels).
+/// Maximum footer region size for stack buffer (pixels x 3 channels).
 const max_footer_buf = 200 * 50 * 3;
 
 pub fn main() !void {
@@ -53,6 +55,7 @@ fn printUsage() void {
         \\
         \\Scan options:
         \\  --title <string>  Window title to find (default: auto-detect "BlueArchive")
+        \\  --wgc             Use Windows Graphics Capture (background capture)
         \\  --list-windows    List all visible windows and exit
         \\  --dump [path]     Save captured image as PPM (default: capture.ppm)
         \\
@@ -62,6 +65,7 @@ fn printUsage() void {
 fn scan(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var window_title: ?[]const u8 = null;
     var dump_path: ?[]const u8 = null;
+    var use_wgc = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--list-windows")) {
@@ -80,6 +84,8 @@ fn scan(allocator: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[i], "--dump")) {
             i += 1;
             dump_path = if (i < args.len) args[i] else "capture.ppm";
+        } else if (std.mem.eql(u8, args[i], "--wgc")) {
+            use_wgc = true;
         }
     }
 
@@ -97,24 +103,44 @@ fn scan(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 return error.WindowNotFound;
             };
 
-    const cap = try capture.captureWindow(allocator, hwnd);
-    defer cap.deinit(allocator);
+    // Choose capture method: WGC (background) or BitBlt (foreground)
+    var pixels: []u8 = undefined;
+    var cap_width: u32 = undefined;
+    var cap_height: u32 = undefined;
 
-    std.debug.print("captured: {d}x{d}\n", .{ cap.width, cap.height });
+    if (use_wgc) {
+        const wgc_result = wgc.captureWindow(allocator, hwnd) catch |err| {
+            std.debug.print("error: WGC capture failed: {s}\n", .{@errorName(err)});
+            return error.CaptureFailed;
+        };
+        pixels = wgc_result.pixels;
+        cap_width = wgc_result.width;
+        cap_height = wgc_result.height;
+    } else {
+        const cap = try capture.captureWindow(allocator, hwnd);
+        pixels = cap.pixels;
+        cap_width = cap.width;
+        cap_height = cap.height;
+    }
+    defer allocator.free(pixels);
+
+    std.debug.print("captured: {d}x{d} (mode={s})\n", .{
+        cap_width, cap_height, if (use_wgc) "wgc" else "bitblt",
+    });
 
     if (dump_path) |path| {
-        savePpm(path, cap.pixels, cap.width, cap.height) catch |err| {
+        savePpm(path, pixels, cap_width, cap_height) catch |err| {
             std.debug.print("warning: failed to save dump: {s}\n", .{@errorName(err)});
         };
     }
 
     // ── Normalize ──
     const norm = try image.normalizePreservingAspect(
-        allocator, cap.pixels, cap.width, cap.height, 3,
+        allocator, pixels, cap_width, cap_height, 3,
     );
     defer norm.deinit(allocator);
 
-    // ── Detect grid ──
+    // ── Detect grid ���─
     const grid_result = try grid.detectGrid(allocator, norm.pixels, norm.width, norm.height);
     defer grid_result.deinit(allocator);
 
@@ -128,7 +154,7 @@ fn scan(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    // ── OCR → CSV ──
+    // ── OCR -> CSV ──
     const n_rows = grid.activeRows(grid_result);
 
     var stdout_buf: [4096]u8 = undefined;
@@ -196,4 +222,25 @@ test "parseArgs: --title sets window title" {
         }
     }
     try std.testing.expectEqualStrings("BlueArchive", window_title.?);
+}
+
+test "parseArgs: --wgc sets flag" {
+    const args = [_][]const u8{ "--wgc", "--title", "Test" };
+    var use_wgc = false;
+    var window_title: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--wgc")) {
+            use_wgc = true;
+        } else if (std.mem.eql(u8, args[i], "--title")) {
+            i += 1;
+            if (i < args.len) window_title = args[i];
+        }
+    }
+    try std.testing.expect(use_wgc);
+    try std.testing.expectEqualStrings("Test", window_title.?);
+}
+
+test "wgc module compiles" {
+    _ = wgc;
 }
